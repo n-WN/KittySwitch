@@ -210,72 +210,89 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         item.tag = tab.id
         item.state = tab.isActive ? .on : .off
 
+        // Main line: icon + title + cwd + resource summary
         let attr = NSMutableAttributedString()
         if info != nil { attr.append(styled("◆ ", size: 13, color: .systemOrange)) }
         attr.append(styled(title, size: 13))
         attr.append(styled("  \(cwd)", size: 11, color: .secondaryLabelColor))
-
-        // Resource summary inline
         if let res {
-            let resStr = formatResourceSummary(res)
             let color: NSColor = res.totalRSS > 500 ? .systemOrange : .tertiaryLabelColor
-            attr.append(styled("  \(resStr)", size: 10, color: color, mono: true))
+            attr.append(styled("  \(formatResourceSummary(res))", size: 10, color: color, mono: true))
         }
         item.attributedTitle = attr
 
-        // Tooltip with full details
-        var tip = tab.title
+        // Submenu: session info + process tree + actions
+        let sub = NSMenu()
+
+        // Session info header
         if let info {
-            tip += "\n\nClaude Code (PID \(info.pid))"
-            tip += "\nSession: \(info.sessionId)"
-            tip += "\nArgs: \(info.args.joined(separator: " "))"
-            if !info.meta.firstPrompt.isEmpty { tip += "\nPrompt: \(info.meta.firstPrompt)" }
-        }
-        if let res {
-            tip += "\n\nResources: \(formatResourceSummary(res))"
-            for proc in res.processes.sorted(by: { $0.rssMB > $1.rssMB }) {
-                let rss = proc.rssMB < 1 ? "<1" : String(format: "%.0f", proc.rssMB)
-                tip += "\n  PID \(proc.pid)  \(rss)MB  \(String(format: "%.1f", proc.cpu))%  \(proc.command)"
-            }
-        }
-        item.toolTip = tip
-        menu.addItem(item)
+            let sessionLabel = NSMenuItem()
+            sessionLabel.isEnabled = false
+            let sAttr = NSMutableAttributedString()
+            sAttr.append(styled("⏣ ", size: 11, color: .systemOrange))
+            sAttr.append(styled(info.sessionId, size: 10, color: .secondaryLabelColor, mono: true))
+            sessionLabel.attributedTitle = sAttr
+            sub.addItem(sessionLabel)
 
-        // Detail line: claude info + process tree
-        if info != nil || (res != nil && res!.count > 1) {
-            let detail = buildDetailLine(info: info, res: res)
-            let sub = NSMenuItem()
-            sub.isEnabled = false
-            sub.attributedTitle = styled(detail, size: 10, color: .tertiaryLabelColor, mono: true)
-            menu.addItem(sub)
-        }
-    }
-
-    private func buildDetailLine(info: ClaudeInfo?, res: TabResources?) -> String {
-        var parts: [String] = ["    "]
-
-        if let info {
-            parts.append("⏣ \(info.sessionId.prefix(8))…")
             let flags = info.args.filter { $0.hasPrefix("--") && $0 != "--resume" }
-            if !flags.isEmpty { parts.append(flags.joined(separator: " ")) }
+            if !flags.isEmpty {
+                let flagLabel = NSMenuItem()
+                flagLabel.isEnabled = false
+                flagLabel.attributedTitle = styled("  \(flags.joined(separator: " "))", size: 10, color: .tertiaryLabelColor, mono: true)
+                sub.addItem(flagLabel)
+            }
+
+            if !info.meta.firstPrompt.isEmpty {
+                let promptLabel = NSMenuItem()
+                promptLabel.isEnabled = false
+                promptLabel.attributedTitle = styled("  « \(truncate(info.meta.firstPrompt, to: 50)) »", size: 10, color: .tertiaryLabelColor)
+                sub.addItem(promptLabel)
+            }
+            sub.addItem(.separator())
         }
 
-        if let res, res.count > 1 {
-            // Show top processes by RSS (excluding the shell itself)
-            let significant = res.processes
-                .filter { $0.rssMB > 0.5 }
-                .sorted { $0.rssMB > $1.rssMB }
-                .prefix(3)
-            let tree = significant.map { proc in
-                let rss = proc.rssMB >= 1024
-                    ? String(format: "%.1fG", proc.rssMB / 1024)
-                    : String(format: "%.0fM", proc.rssMB)
-                return "\(proc.command)(\(rss))"
-            }.joined(separator: " + ")
-            if !tree.isEmpty { parts.append(tree) }
+        // Process tree with kill actions
+        if let res {
+            let headerLabel = NSMenuItem()
+            headerLabel.isEnabled = false
+            headerLabel.attributedTitle = styled("Processes", size: 11, color: .secondaryLabelColor)
+            sub.addItem(headerLabel)
+
+            for proc in res.processes.sorted(by: { $0.rssMB > $1.rssMB }) {
+                let rss = formatRSS(proc.rssMB)
+                let cpu = proc.cpu < 0.1 ? "0%" : String(format: "%.1f%%", proc.cpu)
+
+                let procItem = NSMenuItem(
+                    title: "\(proc.command)  \(rss)  \(cpu)",
+                    action: #selector(killProcess(_:)),
+                    keyEquivalent: ""
+                )
+                procItem.target = self
+                procItem.tag = proc.pid
+
+                let pAttr = NSMutableAttributedString()
+                let dot: String = proc.rssMB > 100 ? "🔴" : proc.rssMB > 10 ? "🟡" : "⚪"
+                pAttr.append(styled("\(dot) ", size: 11))
+                pAttr.append(styled(proc.command, size: 12))
+                pAttr.append(styled("  \(rss)  \(cpu)", size: 10, color: .secondaryLabelColor, mono: true))
+                pAttr.append(styled("  pid:\(proc.pid)", size: 9, color: .tertiaryLabelColor, mono: true))
+                procItem.attributedTitle = pAttr
+                procItem.toolTip = "Click to send SIGTERM to PID \(proc.pid)"
+
+                sub.addItem(procItem)
+            }
+            sub.addItem(.separator())
         }
 
-        return parts.joined(separator: "  ")
+        // Tab actions
+        let closeTab = NSMenuItem(title: "Close Tab", action: #selector(closeKittyTab(_:)), keyEquivalent: "")
+        closeTab.target = self
+        closeTab.tag = tab.id
+        closeTab.attributedTitle = styled("✕  Close Tab", size: 12, color: .systemRed)
+        sub.addItem(closeTab)
+
+        item.submenu = sub
+        menu.addItem(item)
     }
 
     private func buildHistorySection() {
@@ -302,27 +319,41 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 ? String(format: "%.1fMB", Double(session.sizeKB) / 1024)
                 : "\(session.sizeKB)KB"
 
-            // Normal resume
             let item = NSMenuItem(title: prompt, action: nil, keyEquivalent: "")
-            item.target = self
 
             let attr = NSMutableAttributedString()
             attr.append(styled("↻ ", size: 12, color: .systemBlue))
             attr.append(styled(prompt, size: 12))
-            attr.append(styled("  \(cwd)  \(time)  \(session.messageCount) msgs", size: 10, color: .tertiaryLabelColor))
+            attr.append(styled("  \(time)  \(session.messageCount) msgs", size: 10, color: .tertiaryLabelColor))
             item.attributedTitle = attr
-            item.toolTip = "Session: \(session.sessionId)\nCWD: \(session.meta.cwd)\nSize: \(size)\nMessages: \(session.messageCount)"
 
-            // Submenu: two resume modes
+            // Submenu: info + resume actions
             let sub = NSMenu()
+
+            // Session details
+            let idLabel = NSMenuItem()
+            idLabel.isEnabled = false
+            idLabel.attributedTitle = styled("⏣  \(session.sessionId)", size: 10, color: .secondaryLabelColor, mono: true)
+            sub.addItem(idLabel)
+
+            let cwdLabel = NSMenuItem()
+            cwdLabel.isEnabled = false
+            cwdLabel.attributedTitle = styled("📂  \(cwd)  ·  \(size)", size: 10, color: .tertiaryLabelColor)
+            sub.addItem(cwdLabel)
+
+            sub.addItem(.separator())
+
+            // Resume actions
             let normalItem = NSMenuItem(title: "Resume", action: #selector(resumeSession(_:)), keyEquivalent: "")
             normalItem.target = self
             normalItem.representedObject = ResumeInfo(sessionId: session.sessionId, cwd: session.meta.cwd, dangerousMode: false)
+            normalItem.attributedTitle = styled("▶  Resume", size: 12)
             sub.addItem(normalItem)
 
             let dangerItem = NSMenuItem(title: "Resume (skip permissions)", action: #selector(resumeSession(_:)), keyEquivalent: "")
             dangerItem.target = self
             dangerItem.representedObject = ResumeInfo(sessionId: session.sessionId, cwd: session.meta.cwd, dangerousMode: true)
+            dangerItem.attributedTitle = styled("⚡ Resume (skip permissions)", size: 12, color: .systemOrange)
             sub.addItem(dangerItem)
 
             item.submenu = sub
@@ -389,6 +420,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         shell(launchArgs)
         activateKitty()
+    }
+
+    @objc func killProcess(_ sender: NSMenuItem) {
+        let pid = sender.tag
+        guard pid > 0 else { return }
+        kill(Int32(pid), SIGTERM)
+    }
+
+    @objc func closeKittyTab(_ sender: NSMenuItem) {
+        shell("kitty", "@", "close-tab", "--match", "id:\(sender.tag)")
     }
 
     @objc func quitApp() {
@@ -641,6 +682,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func resourcesForTab(_ tab: KittyTab) -> TabResources? {
         guard let win = tab.windows.first else { return nil }
         return tabResourceCache[win.pid]
+    }
+
+    private func formatRSS(_ mb: Double) -> String {
+        mb < 1 ? "<1MB" : mb >= 1024 ? String(format: "%.1fGB", mb / 1024) : String(format: "%.0fMB", mb)
     }
 
     private func formatResourceSummary(_ res: TabResources) -> String {
