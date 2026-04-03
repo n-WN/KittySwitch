@@ -572,35 +572,28 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // MARK: - Process Resources
 
-    /// Collect resource info for all kitty tabs in one batch `ps` call.
+    /// Collect resource info for all kitty tabs using a single `ps -eo` call.
+    /// Builds the process tree in memory — no recursive pgrep, no per-tab fork.
     private func collectAllTabResources() {
-        // Gather all shell PIDs
-        var shellPids: [Int] = []
+        var shellPids = Set<Int>()
         for osWin in cachedState {
             for tab in osWin.tabs {
-                for win in tab.windows {
-                    shellPids.append(win.pid)
-                }
+                for win in tab.windows { shellPids.insert(win.pid) }
             }
         }
         guard !shellPids.isEmpty else { return }
 
-        // Get all descendant PIDs via pgrep, then batch ps
-        var pidToShell: [Int: Int] = [:]  // child PID → root shell PID
-        for shellPid in shellPids {
-            for descendant in getDescendants(of: shellPid) {
-                pidToShell[descendant] = shellPid
-            }
+        // One ps call for the ENTIRE system process table
+        guard let psOutput = shell("ps", "-eo", "pid=,ppid=,rss=,%cpu=,comm=") else { return }
+
+        // Parse into flat list + parent→children map
+        struct RawProc {
+            let pid: Int, ppid: Int, rss: Int
+            let cpu: Double, command: String
         }
+        var allProcs: [Int: RawProc] = [:]
+        var children: [Int: [Int]] = [:]  // ppid → [child pids]
 
-        guard !pidToShell.isEmpty else { return }
-
-        // Single ps call for all PIDs
-        let allPids = pidToShell.keys.map(String.init).joined(separator: ",")
-        guard let psOutput = shell("ps", "-p", allPids, "-o", "pid=,ppid=,rss=,%cpu=,comm=") else { return }
-
-        // Parse and group by shell PID
-        var grouped: [Int: [ProcessInfo]] = [:]
         for line in psOutput.split(separator: "\n") {
             let parts = line.split(separator: " ", maxSplits: 4).map(String.init)
             guard parts.count >= 5,
@@ -609,31 +602,32 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                   let rss = Int(parts[2]),
                   let cpu = Double(parts[3])
             else { continue }
-
-            let proc = ProcessInfo(
-                pid: pid, ppid: ppid,
-                rssMB: Double(rss) / 1024,
-                cpu: cpu,
-                command: shortenCommand(parts[4])
-            )
-            let shellPid = pidToShell[pid] ?? pid
-            grouped[shellPid, default: []].append(proc)
+            allProcs[pid] = RawProc(pid: pid, ppid: ppid, rss: rss, cpu: cpu, command: parts[4])
+            children[ppid, default: []].append(pid)
         }
 
-        for (shellPid, procs) in grouped {
+        // For each shell PID, walk the tree in memory to find all descendants
+        func descendants(of pid: Int) -> [Int] {
+            var result = [pid]
+            for child in children[pid] ?? [] {
+                result.append(contentsOf: descendants(of: child))
+            }
+            return result
+        }
+
+        for shellPid in shellPids {
+            let pids = descendants(of: shellPid)
+            let procs = pids.compactMap { pid -> ProcessInfo? in
+                guard let r = allProcs[pid] else { return nil }
+                return ProcessInfo(
+                    pid: r.pid, ppid: r.ppid,
+                    rssMB: Double(r.rss) / 1024,
+                    cpu: r.cpu,
+                    command: shortenCommand(r.command)
+                )
+            }
             tabResourceCache[shellPid] = TabResources(processes: procs)
         }
-    }
-
-    private func getDescendants(of pid: Int) -> [Int] {
-        var result = [pid]
-        guard let output = shell("pgrep", "-P", String(pid)) else { return result }
-        for line in output.split(separator: "\n") {
-            if let child = Int(line) {
-                result.append(contentsOf: getDescendants(of: child))
-            }
-        }
-        return result
     }
 
     private func shortenCommand(_ cmd: String) -> String {
