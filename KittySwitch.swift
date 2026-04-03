@@ -666,8 +666,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         process.standardError = FileHandle.nullDevice
         do {
             try process.run()
+            // Read BEFORE waitUntilExit to avoid pipe buffer deadlock.
+            // If output > 64KB (pipe buffer), the child blocks on write
+            // while we block on waitUntilExit → deadlock.
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
             process.waitUntilExit()
-            return String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
+            return String(data: data, encoding: .utf8)?
                 .trimmingCharacters(in: .whitespacesAndNewlines)
         } catch {
             return nil
