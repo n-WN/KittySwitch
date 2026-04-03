@@ -53,9 +53,10 @@ struct ClaudeSessionFile: Codable {
 
 struct SessionMeta {
     let firstPrompt: String
+    let lastPrompt: String
     let cwd: String
 
-    static let empty = SessionMeta(firstPrompt: "", cwd: "")
+    static let empty = SessionMeta(firstPrompt: "", lastPrompt: "", cwd: "")
 }
 
 struct ClaudeInfo {
@@ -223,87 +224,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         item.attributedTitle = attr
 
-        // Submenu: session info + process tree + actions
-        let sub = NSMenu()
-
-        // Session info header
-        if let info {
-            // Session ID — click to copy
-            let sessionItem = NSMenuItem(title: info.sessionId, action: #selector(copyText(_:)), keyEquivalent: "")
-            sessionItem.target = self
-            sessionItem.representedObject = info.sessionId
-            sessionItem.toolTip = "Click to copy session ID"
-            let sAttr = NSMutableAttributedString()
-            sAttr.append(styled("⏣ ", size: 11, color: .systemOrange))
-            sAttr.append(styled(info.sessionId, size: 10, color: .secondaryLabelColor, mono: true))
-            sessionItem.attributedTitle = sAttr
-            sub.addItem(sessionItem)
-
-            let flags = info.args.filter { $0.hasPrefix("--") && $0 != "--resume" }
-            if !flags.isEmpty {
-                let flagLabel = NSMenuItem()
-                flagLabel.isEnabled = false
-                flagLabel.attributedTitle = styled("  \(flags.joined(separator: " "))", size: 10, color: .tertiaryLabelColor, mono: true)
-                sub.addItem(flagLabel)
-            }
-
-            // Load prompt lazily (only when submenu is shown)
-            let meta = readSessionMeta(sessionId: info.sessionId)
-            if !meta.firstPrompt.isEmpty {
-                let promptLabel = NSMenuItem()
-                promptLabel.isEnabled = false
-                promptLabel.attributedTitle = NSAttributedString(
-                    string: "  \(truncate(meta.firstPrompt, to: 50))",
-                    attributes: [
-                        .font: NSFont(descriptor: NSFont.systemFont(ofSize: 10).fontDescriptor.withSymbolicTraits(.italic), size: 10) ?? NSFont.systemFont(ofSize: 10),
-                        .foregroundColor: NSColor.tertiaryLabelColor
-                    ]
-                )
-                sub.addItem(promptLabel)
-            }
-            sub.addItem(.separator())
-        }
-
-        // Process tree with kill actions
-        if let res {
-            let headerLabel = NSMenuItem()
-            headerLabel.isEnabled = false
-            headerLabel.attributedTitle = styled("Processes", size: 11, color: .secondaryLabelColor)
-            sub.addItem(headerLabel)
-
-            for proc in res.processes.sorted(by: { $0.rssMB > $1.rssMB }) {
-                let rss = formatRSS(proc.rssMB)
-                let cpu = proc.cpu < 0.1 ? "0%" : String(format: "%.1f%%", proc.cpu)
-
-                let procItem = NSMenuItem(
-                    title: "\(proc.command)  \(rss)  \(cpu)",
-                    action: #selector(killProcess(_:)),
-                    keyEquivalent: ""
-                )
-                procItem.target = self
-                procItem.tag = proc.pid
-
-                let pAttr = NSMutableAttributedString()
-                let dotColor: NSColor = proc.rssMB > 100 ? .systemRed : proc.rssMB > 10 ? .systemYellow : .tertiaryLabelColor
-                pAttr.append(styled("● ", size: 8, color: dotColor))
-                pAttr.append(styled(proc.command, size: 12))
-                pAttr.append(styled("  \(rss)  \(cpu)", size: 10, color: .secondaryLabelColor, mono: true))
-                pAttr.append(styled("  \(proc.pid)", size: 9, color: .tertiaryLabelColor, mono: true))
-                procItem.attributedTitle = pAttr
-                procItem.toolTip = "Click to send SIGTERM to PID \(proc.pid)"
-
-                sub.addItem(procItem)
-            }
-            sub.addItem(.separator())
-        }
-
-        // Tab actions
-        let closeTab = NSMenuItem(title: "Close Tab", action: #selector(closeKittyTab(_:)), keyEquivalent: "")
-        closeTab.target = self
-        closeTab.tag = tab.id
-        closeTab.attributedTitle = styled("✕  Close Tab", size: 12, color: .systemRed)
-        sub.addItem(closeTab)
-
+        // Lazy submenu — content built on hover, not during main menu construction
+        let sub = LazyTabMenu(appDelegate: self, tab: tab, claudeInfo: info, resources: res)
         item.submenu = sub
         menu.addItem(item)
     }
@@ -397,7 +319,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(.separator())
     }
 
-    private func styled(_ text: String, size: CGFloat, color: NSColor? = nil, mono: Bool = false) -> NSAttributedString {
+    func styled(_ text: String, size: CGFloat, color: NSColor? = nil, mono: Bool = false) -> NSAttributedString {
         var attrs: [NSAttributedString.Key: Any] = [
             .font: mono ? NSFont.monospacedSystemFont(ofSize: size, weight: .regular) : NSFont.systemFont(ofSize: size)
         ]
@@ -539,40 +461,87 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // MARK: - JSONL Reading
 
-    private func readSessionMeta(sessionId: String) -> SessionMeta {
+    func readSessionMeta(sessionId: String) -> SessionMeta {
         if let cached = sessionMetaCache[sessionId] { return cached }
         let file = claudeProjectsDir.appendingPathComponent("\(sessionId).jsonl")
         guard let handle = try? FileHandle(forReadingFrom: file) else { return .empty }
         defer { handle.closeFile() }
 
-        let chunk = handle.readData(ofLength: 65536)
-        guard let text = String(data: chunk, encoding: .utf8) else { return .empty }
+        // Read first user message from head (64KB)
+        let headChunk = handle.readData(ofLength: 65536)
+        let firstPrompt = extractFirstUserPrompt(from: headChunk)
+        let cwd = extractCwd(from: headChunk)
 
-        for line in text.components(separatedBy: "\n") where !line.isEmpty {
-            guard let data = line.data(using: .utf8),
-                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  obj["type"] as? String == "user",
-                  let msg = obj["message"] as? [String: Any],
-                  let content = msg["content"]
-            else { continue }
-
-            let cwd = obj["cwd"] as? String ?? ""
-            let prompt: String
-            if let text = content as? String {
-                prompt = String(text.prefix(80)).trimmingCharacters(in: .whitespacesAndNewlines)
-            } else if let arr = content as? [[String: Any]],
-                      let first = arr.first,
-                      let text = first["text"] as? String {
-                prompt = String(text.prefix(80)).trimmingCharacters(in: .whitespacesAndNewlines)
-            } else {
-                prompt = ""
-            }
-            let result = SessionMeta(firstPrompt: prompt, cwd: cwd)
-            sessionMetaCache[sessionId] = result
-            return result
+        // Read last user message from tail (64KB)
+        var lastPrompt = ""
+        let fileSize = handle.seekToEndOfFile()
+        if fileSize > 65536 {
+            handle.seek(toFileOffset: fileSize - 65536)
+            let tailChunk = handle.readData(ofLength: 65536)
+            lastPrompt = extractLastUserPrompt(from: tailChunk)
+        } else {
+            // Small file — scan the head chunk for the last user message too
+            lastPrompt = extractLastUserPrompt(from: headChunk)
         }
-        sessionMetaCache[sessionId] = .empty
-        return .empty
+        if lastPrompt == firstPrompt { lastPrompt = "" }  // don't repeat
+
+        let result = SessionMeta(firstPrompt: firstPrompt, lastPrompt: lastPrompt, cwd: cwd)
+        sessionMetaCache[sessionId] = result
+        return result
+    }
+
+    private func extractUserPrompt(from obj: [String: Any]) -> String? {
+        guard obj["type"] as? String == "user",
+              let msg = obj["message"] as? [String: Any],
+              let content = msg["content"]
+        else { return nil }
+
+        if let text = content as? String {
+            return String(text.prefix(80)).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        if let arr = content as? [[String: Any]],
+           let first = arr.first,
+           let text = first["text"] as? String {
+            return String(text.prefix(80)).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        return nil
+    }
+
+    private func extractCwd(from data: Data) -> String {
+        guard let text = String(data: data, encoding: .utf8) else { return "" }
+        for line in text.components(separatedBy: "\n") where !line.isEmpty {
+            guard let d = line.data(using: .utf8),
+                  let obj = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
+                  obj["type"] as? String == "user"
+            else { continue }
+            return obj["cwd"] as? String ?? ""
+        }
+        return ""
+    }
+
+    private func extractFirstUserPrompt(from data: Data) -> String {
+        guard let text = String(data: data, encoding: .utf8) else { return "" }
+        for line in text.components(separatedBy: "\n") where !line.isEmpty {
+            guard let d = line.data(using: .utf8),
+                  let obj = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
+                  let prompt = extractUserPrompt(from: obj)
+            else { continue }
+            return prompt
+        }
+        return ""
+    }
+
+    private func extractLastUserPrompt(from data: Data) -> String {
+        guard let text = String(data: data, encoding: .utf8) else { return "" }
+        var last = ""
+        for line in text.components(separatedBy: "\n") where !line.isEmpty {
+            guard let d = line.data(using: .utf8),
+                  let obj = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
+                  let prompt = extractUserPrompt(from: obj)
+            else { continue }
+            last = prompt
+        }
+        return last
     }
 
     /// Count lines by streaming in 64KB chunks instead of loading the entire file.
@@ -712,7 +681,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return tabResourceCache[win.pid]
     }
 
-    private func formatRSS(_ mb: Double) -> String {
+    func formatRSS(_ mb: Double) -> String {
         mb < 1 ? "<1MB" : mb >= 1024 ? String(format: "%.1fGB", mb / 1024) : String(format: "%.0fMB", mb)
     }
 
@@ -751,13 +720,118 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    private func truncate(_ text: String, to max: Int) -> String {
+    func truncate(_ text: String, to max: Int) -> String {
         text.count > max ? String(text.prefix(max - 3)) + "..." : text
     }
 
     private func shortenPath(_ path: String) -> String {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
         return path.hasPrefix(home) ? "~" + path.dropFirst(home.count) : path
+    }
+}
+
+// MARK: - Lazy Submenu (built on hover, not during main menu construction)
+
+class LazyTabMenu: NSMenu, NSMenuDelegate {
+    let appDelegate: AppDelegate
+    let tab: KittyTab
+    let claudeInfo: ClaudeInfo?
+    let resources: TabResources?
+    var built = false
+
+    init(appDelegate: AppDelegate, tab: KittyTab, claudeInfo: ClaudeInfo?, resources: TabResources?) {
+        self.appDelegate = appDelegate
+        self.tab = tab
+        self.claudeInfo = claudeInfo
+        self.resources = resources
+        super.init(title: "")
+        self.delegate = self
+        // Placeholder so NSMenu shows the submenu arrow
+        addItem(NSMenuItem(title: "Loading...", action: nil, keyEquivalent: ""))
+    }
+
+    required init(coder: NSCoder) { fatalError() }
+
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        guard !built else { return }
+        built = true
+        removeAllItems()
+
+        let ad = appDelegate
+        let italicFont = NSFont(descriptor: NSFont.systemFont(ofSize: 10).fontDescriptor.withSymbolicTraits(.italic), size: 10) ?? NSFont.systemFont(ofSize: 10)
+        let italicAttrs: [NSAttributedString.Key: Any] = [.font: italicFont, .foregroundColor: NSColor.tertiaryLabelColor]
+
+        // Session info
+        if let info = claudeInfo {
+            let sessionItem = NSMenuItem(title: info.sessionId, action: #selector(AppDelegate.copyText(_:)), keyEquivalent: "")
+            sessionItem.target = ad
+            sessionItem.representedObject = info.sessionId
+            sessionItem.toolTip = "Click to copy session ID"
+            let sAttr = NSMutableAttributedString()
+            sAttr.append(ad.styled("⏣ ", size: 11, color: .systemOrange))
+            sAttr.append(ad.styled(info.sessionId, size: 10, color: .secondaryLabelColor, mono: true))
+            sessionItem.attributedTitle = sAttr
+            addItem(sessionItem)
+
+            let flags = info.args.filter { $0.hasPrefix("--") && $0 != "--resume" }
+            if !flags.isEmpty {
+                let flagLabel = NSMenuItem()
+                flagLabel.isEnabled = false
+                flagLabel.attributedTitle = ad.styled("  \(flags.joined(separator: " "))", size: 10, color: .tertiaryLabelColor, mono: true)
+                addItem(flagLabel)
+            }
+
+            // JSONL read happens HERE — only when submenu is opened
+            let meta = ad.readSessionMeta(sessionId: info.sessionId)
+            if !meta.firstPrompt.isEmpty {
+                let first = NSMenuItem()
+                first.isEnabled = false
+                first.attributedTitle = NSAttributedString(string: "  first: \(ad.truncate(meta.firstPrompt, to: 45))", attributes: italicAttrs)
+                addItem(first)
+            }
+            if !meta.lastPrompt.isEmpty {
+                let last = NSMenuItem()
+                last.isEnabled = false
+                last.attributedTitle = NSAttributedString(string: "  last:  \(ad.truncate(meta.lastPrompt, to: 45))", attributes: italicAttrs)
+                addItem(last)
+            }
+            addItem(.separator())
+        }
+
+        // Process tree
+        if let res = resources {
+            let header = NSMenuItem()
+            header.isEnabled = false
+            header.attributedTitle = ad.styled("Processes", size: 11, color: .secondaryLabelColor)
+            addItem(header)
+
+            for proc in res.processes.sorted(by: { $0.rssMB > $1.rssMB }) {
+                let rss = ad.formatRSS(proc.rssMB)
+                let cpu = proc.cpu < 0.1 ? "0%" : String(format: "%.1f%%", proc.cpu)
+
+                let procItem = NSMenuItem(title: proc.command, action: #selector(AppDelegate.killProcess(_:)), keyEquivalent: "")
+                procItem.target = ad
+                procItem.tag = proc.pid
+
+                let pAttr = NSMutableAttributedString()
+                let dotColor: NSColor = proc.rssMB > 100 ? .systemRed : proc.rssMB > 10 ? .systemYellow : .tertiaryLabelColor
+                pAttr.append(ad.styled("● ", size: 8, color: dotColor))
+                pAttr.append(ad.styled(proc.command, size: 12))
+                pAttr.append(ad.styled("  \(rss)  \(cpu)", size: 10, color: .secondaryLabelColor, mono: true))
+                pAttr.append(ad.styled("  \(proc.pid)", size: 9, color: .tertiaryLabelColor, mono: true))
+                procItem.attributedTitle = pAttr
+                procItem.toolTip = "Click to send SIGTERM to PID \(proc.pid)"
+                addItem(procItem)
+            }
+            addItem(.separator())
+        }
+
+        // Close tab
+        let closeTab = NSMenuItem(title: "Close Tab", action: #selector(AppDelegate.closeKittyTab(_:)), keyEquivalent: "")
+        closeTab.target = ad
+        closeTab.tag = tab.id
+        closeTab.attributedTitle = ad.styled("✕  Close Tab", size: 12, color: .systemRed)
+        addItem(closeTab)
     }
 }
 
