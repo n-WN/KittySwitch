@@ -159,8 +159,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         messageCountCache = [:]
         tabResourceCache = [:]
         cachedState = fetchKittyState()
-        collectAllTabResources()
         sessionFileCache = loadSessionFiles()
+        resourcesCollected = false
+        collectAllTabResources()  // single ps -eo ~20ms, builds tree in memory
+        resourcesCollected = true
         menu.removeAllItems()
 
         buildActiveSection()
@@ -201,7 +203,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func addTabItem(_ tab: KittyTab) {
         let info = extractClaudeInfo(from: tab)
-        let res = resourcesForTab(tab)
         let title = truncate(tab.title, to: 50)
         let cwd = tab.windows.first.map { shortenPath($0.cwd) } ?? ""
 
@@ -210,7 +211,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         item.tag = tab.id
         item.state = tab.isActive ? .on : .off
 
-        // Main line: icon + title + cwd + resource summary
+        // Main line: icon + title + cwd + resource summary (from cache, no I/O)
+        let res = resourcesForTab(tab)
         let attr = NSMutableAttributedString()
         if info != nil { attr.append(styled("◆ ", size: 13, color: .systemOrange)) }
         attr.append(styled(title, size: 13))
@@ -226,13 +228,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         // Session info header
         if let info {
-            let sessionLabel = NSMenuItem()
-            sessionLabel.isEnabled = false
+            // Session ID — click to copy
+            let sessionItem = NSMenuItem(title: info.sessionId, action: #selector(copyText(_:)), keyEquivalent: "")
+            sessionItem.target = self
+            sessionItem.representedObject = info.sessionId
+            sessionItem.toolTip = "Click to copy session ID"
             let sAttr = NSMutableAttributedString()
             sAttr.append(styled("⏣ ", size: 11, color: .systemOrange))
             sAttr.append(styled(info.sessionId, size: 10, color: .secondaryLabelColor, mono: true))
-            sessionLabel.attributedTitle = sAttr
-            sub.addItem(sessionLabel)
+            sessionItem.attributedTitle = sAttr
+            sub.addItem(sessionItem)
 
             let flags = info.args.filter { $0.hasPrefix("--") && $0 != "--resume" }
             if !flags.isEmpty {
@@ -242,10 +247,18 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 sub.addItem(flagLabel)
             }
 
-            if !info.meta.firstPrompt.isEmpty {
+            // Load prompt lazily (only when submenu is shown)
+            let meta = readSessionMeta(sessionId: info.sessionId)
+            if !meta.firstPrompt.isEmpty {
                 let promptLabel = NSMenuItem()
                 promptLabel.isEnabled = false
-                promptLabel.attributedTitle = styled("  « \(truncate(info.meta.firstPrompt, to: 50)) »", size: 10, color: .tertiaryLabelColor)
+                promptLabel.attributedTitle = NSAttributedString(
+                    string: "  \(truncate(meta.firstPrompt, to: 50))",
+                    attributes: [
+                        .font: NSFont(descriptor: NSFont.systemFont(ofSize: 10).fontDescriptor.withSymbolicTraits(.italic), size: 10) ?? NSFont.systemFont(ofSize: 10),
+                        .foregroundColor: NSColor.tertiaryLabelColor
+                    ]
+                )
                 sub.addItem(promptLabel)
             }
             sub.addItem(.separator())
@@ -271,11 +284,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 procItem.tag = proc.pid
 
                 let pAttr = NSMutableAttributedString()
-                let dot: String = proc.rssMB > 100 ? "🔴" : proc.rssMB > 10 ? "🟡" : "⚪"
-                pAttr.append(styled("\(dot) ", size: 11))
+                let dotColor: NSColor = proc.rssMB > 100 ? .systemRed : proc.rssMB > 10 ? .systemYellow : .tertiaryLabelColor
+                pAttr.append(styled("● ", size: 8, color: dotColor))
                 pAttr.append(styled(proc.command, size: 12))
                 pAttr.append(styled("  \(rss)  \(cpu)", size: 10, color: .secondaryLabelColor, mono: true))
-                pAttr.append(styled("  pid:\(proc.pid)", size: 9, color: .tertiaryLabelColor, mono: true))
+                pAttr.append(styled("  \(proc.pid)", size: 9, color: .tertiaryLabelColor, mono: true))
                 procItem.attributedTitle = pAttr
                 procItem.toolTip = "Click to send SIGTERM to PID \(proc.pid)"
 
@@ -330,15 +343,17 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             // Submenu: info + resume actions
             let sub = NSMenu()
 
-            // Session details
-            let idLabel = NSMenuItem()
-            idLabel.isEnabled = false
-            idLabel.attributedTitle = styled("⏣  \(session.sessionId)", size: 10, color: .secondaryLabelColor, mono: true)
-            sub.addItem(idLabel)
+            // Session ID — click to copy
+            let idItem = NSMenuItem(title: session.sessionId, action: #selector(copyText(_:)), keyEquivalent: "")
+            idItem.target = self
+            idItem.representedObject = session.sessionId
+            idItem.toolTip = "Click to copy session ID"
+            idItem.attributedTitle = styled("⏣  \(session.sessionId)", size: 10, color: .secondaryLabelColor, mono: true)
+            sub.addItem(idItem)
 
             let cwdLabel = NSMenuItem()
             cwdLabel.isEnabled = false
-            cwdLabel.attributedTitle = styled("📂  \(cwd)  ·  \(size)", size: 10, color: .tertiaryLabelColor)
+            cwdLabel.attributedTitle = styled("  \(cwd)  ·  \(size)", size: 10, color: .tertiaryLabelColor)
             sub.addItem(cwdLabel)
 
             sub.addItem(.separator())
@@ -353,7 +368,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let dangerItem = NSMenuItem(title: "Resume (skip permissions)", action: #selector(resumeSession(_:)), keyEquivalent: "")
             dangerItem.target = self
             dangerItem.representedObject = ResumeInfo(sessionId: session.sessionId, cwd: session.meta.cwd, dangerousMode: true)
-            dangerItem.attributedTitle = styled("⚡ Resume (skip permissions)", size: 12, color: .systemOrange)
+            dangerItem.attributedTitle = styled("  Resume (skip permissions)", size: 12, color: .systemOrange)
             sub.addItem(dangerItem)
 
             item.submenu = sub
@@ -422,6 +437,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         activateKitty()
     }
 
+    @objc func copyText(_ sender: NSMenuItem) {
+        guard let text = sender.representedObject as? String else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+    }
+
     @objc func killProcess(_ sender: NSMenuItem) {
         let pid = sender.tag
         guard pid > 0 else { return }
@@ -488,13 +509,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
                 guard let sid = sessionId else { continue }
 
+                // meta and messageCount are loaded lazily (only when submenu opens)
                 return ClaudeInfo(
                     sessionId: sid,
                     pid: proc.pid,
                     args: args,
-                    meta: readSessionMeta(sessionId: sid),
+                    meta: .empty,
                     startedAt: startedAt ?? Date(),
-                    messageCount: countMessages(sessionId: sid)
+                    messageCount: 0
                 )
             }
         }
@@ -679,7 +701,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return base.isEmpty ? cmd : base
     }
 
+    private var resourcesCollected = false
+
     private func resourcesForTab(_ tab: KittyTab) -> TabResources? {
+        if !resourcesCollected {
+            collectAllTabResources()
+            resourcesCollected = true
+        }
         guard let win = tab.windows.first else { return nil }
         return tabResourceCache[win.pid]
     }
