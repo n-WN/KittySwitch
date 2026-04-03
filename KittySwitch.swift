@@ -501,10 +501,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                         claudeProjectsDir.appendingPathComponent("\($0).jsonl").path)
                 }
 
-                // For auto-resume, try searching all project dirs
+                // For auto-resume, search all project dirs
                 if resolvedJsonlId == nil, let sid = sessionId {
                     resolvedJsonlId = findJsonlForSession(sid)
                 }
+
+                // Still not found: will be resolved by mtime matching in a post-pass
+                // Store unresolved sessions for later
 
                 guard let sid = sessionId ?? jsonlId else { continue }
 
@@ -536,9 +539,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return ids
     }
 
-    /// Find the JSONL file for a session by scanning all project directories.
-    /// Claude Code may store JSONL under different project paths (cwd-based).
-    /// Returns the JSONL session ID (= filename without .jsonl).
+    /// Find the JSONL file for a session. Tries:
+    /// 1. Direct filename match in all project dirs
+    /// 2. Mtime-based matching for resumed sessions whose PID file ID differs from JSONL filename
     private func findJsonlForSession(_ targetId: String) -> String? {
         let projectsBase = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".claude/projects")
@@ -546,13 +549,40 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             at: projectsBase, includingPropertiesForKeys: nil
         ) else { return nil }
 
+        // 1. Direct match
         for dir in projectDirs {
             let candidate = dir.appendingPathComponent("\(targetId).jsonl")
             if FileManager.default.fileExists(atPath: candidate.path) {
                 return targetId
             }
         }
-        return nil
+
+        // 2. Mtime-based: find recently-modified JSOJNLs not already claimed by another session
+        let claimedIds = Set(sessionFileCache.values.compactMap { sf -> String? in
+            let path = claudeProjectsDir.appendingPathComponent("\(sf.sessionId).jsonl").path
+            return FileManager.default.fileExists(atPath: path) ? sf.sessionId : nil
+        })
+
+        // Get recent JSONL files sorted by mtime desc
+        guard let jsonls = try? FileManager.default.contentsOfDirectory(
+            at: claudeProjectsDir,
+            includingPropertiesForKeys: [.contentModificationDateKey]
+        ) else { return nil }
+
+        let candidates = jsonls.filter { $0.pathExtension == "jsonl" }
+            .compactMap { url -> (String, Date)? in
+                let sid = url.deletingPathExtension().lastPathComponent
+                guard !claimedIds.contains(sid),
+                      let attrs = try? url.resourceValues(forKeys: [.contentModificationDateKey]),
+                      let mtime = attrs.contentModificationDate,
+                      Date().timeIntervalSince(mtime) < 86400  // modified in last 24h
+                else { return nil }
+                return (sid, mtime)
+            }
+            .sorted { $0.1 > $1.1 }
+
+        // Return the most recently modified unclaimed JSONL
+        return candidates.first?.0
     }
 
     /// Resolve the project dir that contains a given session's JSONL.
