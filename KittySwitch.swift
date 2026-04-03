@@ -67,6 +67,21 @@ struct ClaudeInfo {
     let messageCount: Int
 }
 
+struct ProcessInfo {
+    let pid: Int
+    let ppid: Int
+    let rssMB: Double
+    let cpu: Double
+    let command: String
+}
+
+struct TabResources {
+    let processes: [ProcessInfo]
+    var totalRSS: Double { processes.reduce(0) { $0 + $1.rssMB } }
+    var totalCPU: Double { processes.reduce(0) { $0 + $1.cpu } }
+    var count: Int { processes.count }
+}
+
 struct HistorySession {
     let sessionId: String
     let meta: SessionMeta
@@ -86,6 +101,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var sessionFileCache: [Int: ClaudeSessionFile] = [:]
     private var sessionMetaCache: [String: SessionMeta] = [:]
     private var messageCountCache: [String: Int] = [:]
+    private var tabResourceCache: [Int: TabResources] = [:]  // shell PID → resources
 
     let slowInterval: TimeInterval = 5.0
     let fastInterval: TimeInterval = 1.0
@@ -141,7 +157,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func updateMenu() {
         sessionMetaCache = [:]
         messageCountCache = [:]
+        tabResourceCache = [:]
         cachedState = fetchKittyState()
+        collectAllTabResources()
         sessionFileCache = loadSessionFiles()
         menu.removeAllItems()
 
@@ -175,12 +193,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         addSeparator()
         let total = cachedState.reduce(0) { $0 + $1.tabs.count }
-        addLabel("\(total) tabs")
+        let totalRSS = tabResourceCache.values.reduce(0.0) { $0 + $1.totalRSS }
+        let totalCPU = tabResourceCache.values.reduce(0.0) { $0 + $1.totalCPU }
+        let rssStr = totalRSS >= 1024 ? String(format: "%.1f GB", totalRSS / 1024) : String(format: "%.0f MB", totalRSS)
+        addLabel("\(total) tabs  ·  \(rssStr)  ·  \(String(format: "%.1f", totalCPU))% CPU")
     }
 
     private func addTabItem(_ tab: KittyTab) {
         let info = extractClaudeInfo(from: tab)
-        let title = truncate(tab.title, to: 55)
+        let res = resourcesForTab(tab)
+        let title = truncate(tab.title, to: 50)
         let cwd = tab.windows.first.map { shortenPath($0.cwd) } ?? ""
 
         let item = NSMenuItem(title: title, action: #selector(focusTab(_:)), keyEquivalent: "")
@@ -192,20 +214,36 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if info != nil { attr.append(styled("◆ ", size: 13, color: .systemOrange)) }
         attr.append(styled(title, size: 13))
         attr.append(styled("  \(cwd)", size: 11, color: .secondaryLabelColor))
+
+        // Resource summary inline
+        if let res {
+            let resStr = formatResourceSummary(res)
+            let color: NSColor = res.totalRSS > 500 ? .systemOrange : .tertiaryLabelColor
+            attr.append(styled("  \(resStr)", size: 10, color: color, mono: true))
+        }
         item.attributedTitle = attr
 
+        // Tooltip with full details
+        var tip = tab.title
         if let info {
-            var tip = tab.title
             tip += "\n\nClaude Code (PID \(info.pid))"
             tip += "\nSession: \(info.sessionId)"
             tip += "\nArgs: \(info.args.joined(separator: " "))"
             if !info.meta.firstPrompt.isEmpty { tip += "\nPrompt: \(info.meta.firstPrompt)" }
-            item.toolTip = tip
         }
+        if let res {
+            tip += "\n\nResources: \(formatResourceSummary(res))"
+            for proc in res.processes.sorted(by: { $0.rssMB > $1.rssMB }) {
+                let rss = proc.rssMB < 1 ? "<1" : String(format: "%.0f", proc.rssMB)
+                tip += "\n  PID \(proc.pid)  \(rss)MB  \(String(format: "%.1f", proc.cpu))%  \(proc.command)"
+            }
+        }
+        item.toolTip = tip
         menu.addItem(item)
 
-        if let info {
-            let detail = formatClaudeDetail(info)
+        // Detail line: claude info + process tree
+        if info != nil || (res != nil && res!.count > 1) {
+            let detail = buildDetailLine(info: info, res: res)
             let sub = NSMenuItem()
             sub.isEnabled = false
             sub.attributedTitle = styled(detail, size: 10, color: .tertiaryLabelColor, mono: true)
@@ -213,11 +251,30 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    private func formatClaudeDetail(_ info: ClaudeInfo) -> String {
-        var parts = ["     ⏣ \(info.sessionId.prefix(8))…"]
-        let flags = info.args.filter { $0.hasPrefix("--") && $0 != "--resume" }
-        if !flags.isEmpty { parts.append(flags.joined(separator: " ")) }
-        if !info.meta.firstPrompt.isEmpty { parts.append("« \(truncate(info.meta.firstPrompt, to: 40)) »") }
+    private func buildDetailLine(info: ClaudeInfo?, res: TabResources?) -> String {
+        var parts: [String] = ["    "]
+
+        if let info {
+            parts.append("⏣ \(info.sessionId.prefix(8))…")
+            let flags = info.args.filter { $0.hasPrefix("--") && $0 != "--resume" }
+            if !flags.isEmpty { parts.append(flags.joined(separator: " ")) }
+        }
+
+        if let res, res.count > 1 {
+            // Show top processes by RSS (excluding the shell itself)
+            let significant = res.processes
+                .filter { $0.rssMB > 0.5 }
+                .sorted { $0.rssMB > $1.rssMB }
+                .prefix(3)
+            let tree = significant.map { proc in
+                let rss = proc.rssMB >= 1024
+                    ? String(format: "%.1fG", proc.rssMB / 1024)
+                    : String(format: "%.0fM", proc.rssMB)
+                return "\(proc.command)(\(rss))"
+            }.joined(separator: " + ")
+            if !tree.isEmpty { parts.append(tree) }
+        }
+
         return parts.joined(separator: "  ")
     }
 
@@ -511,6 +568,91 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 sizeKB: c.sizeKB
             )
         }
+    }
+
+    // MARK: - Process Resources
+
+    /// Collect resource info for all kitty tabs in one batch `ps` call.
+    private func collectAllTabResources() {
+        // Gather all shell PIDs
+        var shellPids: [Int] = []
+        for osWin in cachedState {
+            for tab in osWin.tabs {
+                for win in tab.windows {
+                    shellPids.append(win.pid)
+                }
+            }
+        }
+        guard !shellPids.isEmpty else { return }
+
+        // Get all descendant PIDs via pgrep, then batch ps
+        var pidToShell: [Int: Int] = [:]  // child PID → root shell PID
+        for shellPid in shellPids {
+            for descendant in getDescendants(of: shellPid) {
+                pidToShell[descendant] = shellPid
+            }
+        }
+
+        guard !pidToShell.isEmpty else { return }
+
+        // Single ps call for all PIDs
+        let allPids = pidToShell.keys.map(String.init).joined(separator: ",")
+        guard let psOutput = shell("ps", "-p", allPids, "-o", "pid=,ppid=,rss=,%cpu=,comm=") else { return }
+
+        // Parse and group by shell PID
+        var grouped: [Int: [ProcessInfo]] = [:]
+        for line in psOutput.split(separator: "\n") {
+            let parts = line.split(separator: " ", maxSplits: 4).map(String.init)
+            guard parts.count >= 5,
+                  let pid = Int(parts[0]),
+                  let ppid = Int(parts[1]),
+                  let rss = Int(parts[2]),
+                  let cpu = Double(parts[3])
+            else { continue }
+
+            let proc = ProcessInfo(
+                pid: pid, ppid: ppid,
+                rssMB: Double(rss) / 1024,
+                cpu: cpu,
+                command: shortenCommand(parts[4])
+            )
+            let shellPid = pidToShell[pid] ?? pid
+            grouped[shellPid, default: []].append(proc)
+        }
+
+        for (shellPid, procs) in grouped {
+            tabResourceCache[shellPid] = TabResources(processes: procs)
+        }
+    }
+
+    private func getDescendants(of pid: Int) -> [Int] {
+        var result = [pid]
+        guard let output = shell("pgrep", "-P", String(pid)) else { return result }
+        for line in output.split(separator: "\n") {
+            if let child = Int(line) {
+                result.append(contentsOf: getDescendants(of: child))
+            }
+        }
+        return result
+    }
+
+    private func shortenCommand(_ cmd: String) -> String {
+        // "/opt/homebrew/bin/fish" → "fish"
+        let base = (cmd as NSString).lastPathComponent
+        return base.isEmpty ? cmd : base
+    }
+
+    private func resourcesForTab(_ tab: KittyTab) -> TabResources? {
+        guard let win = tab.windows.first else { return nil }
+        return tabResourceCache[win.pid]
+    }
+
+    private func formatResourceSummary(_ res: TabResources) -> String {
+        let rss = res.totalRSS < 1 ? "<1MB" :
+                  res.totalRSS >= 1024 ? String(format: "%.1fGB", res.totalRSS / 1024) :
+                  String(format: "%.0fMB", res.totalRSS)
+        let cpu = res.totalCPU < 0.1 ? "0%" : String(format: "%.1f%%", res.totalCPU)
+        return "\(rss)  \(cpu)  \(res.count)p"
     }
 
     // MARK: - Helpers
