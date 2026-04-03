@@ -60,7 +60,8 @@ struct SessionMeta {
 }
 
 struct ClaudeInfo {
-    let sessionId: String
+    let sessionId: String       // current session ID (from session file)
+    let jsonlSessionId: String  // ID that maps to the .jsonl filename
     let pid: Int
     let args: [String]
     let meta: SessionMeta
@@ -417,23 +418,33 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
                 let args = Array(proc.cmdline[(idx + 1)...])
 
-                // Resolve session ID: session file (by PID) → --resume arg fallback
                 var sessionId: String?
+                var jsonlId: String?
                 var startedAt: Date?
 
+                // Session file gives us the current (possibly new) session ID
                 if let sf = sessionFileCache[proc.pid] {
                     sessionId = sf.sessionId
                     startedAt = Date(timeIntervalSince1970: Double(sf.startedAt) / 1000)
-                } else if let ri = args.firstIndex(of: "--resume"), ri + 1 < args.count,
-                          args[ri + 1].count > 30, args[ri + 1].contains("-") {
-                    sessionId = args[ri + 1]
                 }
 
-                guard let sid = sessionId else { continue }
+                // --resume arg gives us the original session ID (= JSONL filename)
+                if let ri = args.firstIndex(of: "--resume"), ri + 1 < args.count,
+                   args[ri + 1].count > 30, args[ri + 1].contains("-") {
+                    jsonlId = args[ri + 1]
+                }
 
-                // meta and messageCount are loaded lazily (only when submenu opens)
+                // Resolve JSONL ID: --resume arg > session file ID > nil
+                let resolvedJsonlId = [jsonlId, sessionId].compactMap { $0 }.first {
+                    FileManager.default.fileExists(atPath:
+                        claudeProjectsDir.appendingPathComponent("\($0).jsonl").path)
+                }
+
+                guard let sid = sessionId ?? jsonlId else { continue }
+
                 return ClaudeInfo(
                     sessionId: sid,
+                    jsonlSessionId: resolvedJsonlId ?? sid,
                     pid: proc.pid,
                     args: args,
                     meta: .empty,
@@ -782,7 +793,7 @@ class LazyTabMenu: NSMenu, NSMenuDelegate {
             }
 
             // JSONL read happens HERE — only when submenu is opened
-            let meta = ad.readSessionMeta(sessionId: info.sessionId)
+            let meta = ad.readSessionMeta(sessionId: info.jsonlSessionId)
             if !meta.firstPrompt.isEmpty {
                 let first = NSMenuItem()
                 first.isEnabled = false
