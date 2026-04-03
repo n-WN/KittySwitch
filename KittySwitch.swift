@@ -595,14 +595,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         var children: [Int: [Int]] = [:]  // ppid → [child pids]
 
         for line in psOutput.split(separator: "\n") {
-            let parts = line.split(separator: " ", maxSplits: 4).map(String.init)
-            guard parts.count >= 5,
-                  let pid = Int(parts[0]),
-                  let ppid = Int(parts[1]),
-                  let rss = Int(parts[2]),
-                  let cpu = Double(parts[3])
+            // split omitting empty subsequences handles leading/multiple spaces
+            let tokens = line.split(omittingEmptySubsequences: true, whereSeparator: { $0 == " " })
+            guard tokens.count >= 5,
+                  let pid = Int(tokens[0]),
+                  let ppid = Int(tokens[1]),
+                  let rss = Int(tokens[2]),
+                  let cpu = Double(tokens[3])
             else { continue }
-            allProcs[pid] = RawProc(pid: pid, ppid: ppid, rss: rss, cpu: cpu, command: parts[4])
+            let command = tokens[4...].joined(separator: " ")
+            allProcs[pid] = RawProc(pid: pid, ppid: ppid, rss: rss, cpu: cpu, command: command)
             children[ppid, default: []].append(pid)
         }
 
