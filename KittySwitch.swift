@@ -130,8 +130,76 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.delegate = self
         menu.autoenablesItems = false
         statusItem.menu = menu
-        updateMenu()
+        refreshDataInBackground()
         startTimer(interval: slowInterval)
+    }
+
+    // MARK: - Background Data Refresh
+
+    /// Refresh data in background so menu opens instantly from cache.
+    private func refreshDataInBackground() {
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            let state = self.fetchKittyState()
+            let sessions = self.loadSessionFiles()
+
+            // Build process tree in background
+            var resources: [Int: TabResources] = [:]
+            if !state.isEmpty {
+                resources = self.buildResourceMap(for: state)
+            }
+
+            DispatchQueue.main.async {
+                self.cachedState = state
+                self.sessionFileCache = sessions
+                self.tabResourceCache = resources
+                self.sessionMetaCache = [:]
+                self.messageCountCache = [:]
+
+                let tabCount = state.reduce(0) { $0 + $1.tabs.count }
+                self.statusItem.button?.title = " \(tabCount)"
+            }
+        }
+    }
+
+    /// Build resource map (calls ps -eo) — safe to call off main thread.
+    private func buildResourceMap(for state: [KittyOSWindow]) -> [Int: TabResources] {
+        var shellPids = Set<Int>()
+        for osWin in state {
+            for tab in osWin.tabs {
+                for win in tab.windows { shellPids.insert(win.pid) }
+            }
+        }
+        guard !shellPids.isEmpty,
+              let psOutput = shell("ps", "-eo", "pid=,ppid=,rss=,%cpu=,comm=")
+        else { return [:] }
+
+        var allProcs: [Int: (pid: Int, ppid: Int, rss: Int, cpu: Double, cmd: String)] = [:]
+        var children: [Int: [Int]] = [:]
+        for line in psOutput.split(separator: "\n") {
+            let tokens = line.split(omittingEmptySubsequences: true, whereSeparator: { $0 == " " })
+            guard tokens.count >= 5, let pid = Int(tokens[0]), let ppid = Int(tokens[1]),
+                  let rss = Int(tokens[2]), let cpu = Double(tokens[3]) else { continue }
+            allProcs[pid] = (pid, ppid, rss, cpu, tokens[4...].joined(separator: " "))
+            children[ppid, default: []].append(pid)
+        }
+
+        func descendants(of pid: Int) -> [Int] {
+            var result = [pid]
+            for child in children[pid] ?? [] { result.append(contentsOf: descendants(of: child)) }
+            return result
+        }
+
+        var map: [Int: TabResources] = [:]
+        for shellPid in shellPids {
+            let procs = descendants(of: shellPid).compactMap { pid -> ProcessInfo? in
+                guard let r = allProcs[pid] else { return nil }
+                return ProcessInfo(pid: r.pid, ppid: r.ppid, rssMB: Double(r.rss) / 1024,
+                                   cpu: r.cpu, command: shortenCommand(r.cmd))
+            }
+            map[shellPid] = TabResources(processes: procs)
+        }
+        return map
     }
 
     // MARK: - Timer
@@ -139,14 +207,17 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func startTimer(interval: TimeInterval) {
         refreshTimer?.invalidate()
         refreshTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
-            self?.updateMenu()
+            self?.refreshDataInBackground()
         }
     }
 
     // MARK: - NSMenuDelegate
 
     func menuNeedsUpdate(_ menu: NSMenu) {
-        updateMenu()
+        // Build menu instantly from cached data (0 ms)
+        rebuildMenuFromCache()
+        // Kick off a fresh background refresh for next open
+        refreshDataInBackground()
         startTimer(interval: fastInterval)
     }
 
@@ -156,21 +227,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // MARK: - Menu Construction
 
-    private func updateMenu() {
-        sessionMetaCache = [:]
-        messageCountCache = [:]
-        tabResourceCache = [:]
-        cachedState = fetchKittyState()
-        sessionFileCache = loadSessionFiles()
-        resourcesCollected = false
-        collectAllTabResources()  // single ps -eo ~20ms, builds tree in memory
-        resourcesCollected = true
+    private func rebuildMenuFromCache() {
         menu.removeAllItems()
-
         buildActiveSection()
         buildHistorySection()
         buildFooter()
-
         let tabCount = cachedState.reduce(0) { $0 + $1.tabs.count }
         statusItem.button?.title = " \(tabCount)"
     }
@@ -434,10 +495,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     jsonlId = args[ri + 1]
                 }
 
-                // Resolve JSONL ID: --resume arg > session file ID > nil
-                let resolvedJsonlId = [jsonlId, sessionId].compactMap { $0 }.first {
+                // Resolve JSONL ID: --resume arg > session file ID > scan by content
+                var resolvedJsonlId = [jsonlId, sessionId].compactMap { $0 }.first {
                     FileManager.default.fileExists(atPath:
                         claudeProjectsDir.appendingPathComponent("\($0).jsonl").path)
+                }
+
+                // For auto-resume, try searching all project dirs
+                if resolvedJsonlId == nil, let sid = sessionId {
+                    resolvedJsonlId = findJsonlForSession(sid)
                 }
 
                 guard let sid = sessionId ?? jsonlId else { continue }
@@ -470,11 +536,49 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return ids
     }
 
+    /// Find the JSONL file for a session by scanning all project directories.
+    /// Claude Code may store JSONL under different project paths (cwd-based).
+    /// Returns the JSONL session ID (= filename without .jsonl).
+    private func findJsonlForSession(_ targetId: String) -> String? {
+        let projectsBase = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".claude/projects")
+        guard let projectDirs = try? FileManager.default.contentsOfDirectory(
+            at: projectsBase, includingPropertiesForKeys: nil
+        ) else { return nil }
+
+        for dir in projectDirs {
+            let candidate = dir.appendingPathComponent("\(targetId).jsonl")
+            if FileManager.default.fileExists(atPath: candidate.path) {
+                return targetId
+            }
+        }
+        return nil
+    }
+
+    /// Resolve the project dir that contains a given session's JSONL.
+    func resolveJsonlPath(sessionId: String) -> URL? {
+        let projectsBase = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".claude/projects")
+        guard let projectDirs = try? FileManager.default.contentsOfDirectory(
+            at: projectsBase, includingPropertiesForKeys: nil
+        ) else { return nil }
+
+        for dir in projectDirs {
+            let candidate = dir.appendingPathComponent("\(sessionId).jsonl")
+            if FileManager.default.fileExists(atPath: candidate.path) {
+                return candidate
+            }
+        }
+        return nil
+    }
+
     // MARK: - JSONL Reading
 
     func readSessionMeta(sessionId: String) -> SessionMeta {
         if let cached = sessionMetaCache[sessionId] { return cached }
-        let file = claudeProjectsDir.appendingPathComponent("\(sessionId).jsonl")
+        // Try primary project dir first, then search all dirs
+        let file = resolveJsonlPath(sessionId: sessionId)
+            ?? claudeProjectsDir.appendingPathComponent("\(sessionId).jsonl")
         guard let handle = try? FileHandle(forReadingFrom: file) else { return .empty }
         defer { handle.closeFile() }
 
@@ -615,65 +719,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // MARK: - Process Resources
 
-    /// Collect resource info for all kitty tabs using a single `ps -eo` call.
-    /// Builds the process tree in memory — no recursive pgrep, no per-tab fork.
-    private func collectAllTabResources() {
-        var shellPids = Set<Int>()
-        for osWin in cachedState {
-            for tab in osWin.tabs {
-                for win in tab.windows { shellPids.insert(win.pid) }
-            }
-        }
-        guard !shellPids.isEmpty else { return }
-
-        // One ps call for the ENTIRE system process table
-        guard let psOutput = shell("ps", "-eo", "pid=,ppid=,rss=,%cpu=,comm=") else { return }
-
-        // Parse into flat list + parent→children map
-        struct RawProc {
-            let pid: Int, ppid: Int, rss: Int
-            let cpu: Double, command: String
-        }
-        var allProcs: [Int: RawProc] = [:]
-        var children: [Int: [Int]] = [:]  // ppid → [child pids]
-
-        for line in psOutput.split(separator: "\n") {
-            // split omitting empty subsequences handles leading/multiple spaces
-            let tokens = line.split(omittingEmptySubsequences: true, whereSeparator: { $0 == " " })
-            guard tokens.count >= 5,
-                  let pid = Int(tokens[0]),
-                  let ppid = Int(tokens[1]),
-                  let rss = Int(tokens[2]),
-                  let cpu = Double(tokens[3])
-            else { continue }
-            let command = tokens[4...].joined(separator: " ")
-            allProcs[pid] = RawProc(pid: pid, ppid: ppid, rss: rss, cpu: cpu, command: command)
-            children[ppid, default: []].append(pid)
-        }
-
-        // For each shell PID, walk the tree in memory to find all descendants
-        func descendants(of pid: Int) -> [Int] {
-            var result = [pid]
-            for child in children[pid] ?? [] {
-                result.append(contentsOf: descendants(of: child))
-            }
-            return result
-        }
-
-        for shellPid in shellPids {
-            let pids = descendants(of: shellPid)
-            let procs = pids.compactMap { pid -> ProcessInfo? in
-                guard let r = allProcs[pid] else { return nil }
-                return ProcessInfo(
-                    pid: r.pid, ppid: r.ppid,
-                    rssMB: Double(r.rss) / 1024,
-                    cpu: r.cpu,
-                    command: shortenCommand(r.command)
-                )
-            }
-            tabResourceCache[shellPid] = TabResources(processes: procs)
-        }
-    }
+    // collectAllTabResources moved to buildResourceMap (runs off main thread)
 
     private func shortenCommand(_ cmd: String) -> String {
         // "/opt/homebrew/bin/fish" → "fish"
@@ -681,13 +727,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return base.isEmpty ? cmd : base
     }
 
-    private var resourcesCollected = false
-
     private func resourcesForTab(_ tab: KittyTab) -> TabResources? {
-        if !resourcesCollected {
-            collectAllTabResources()
-            resourcesCollected = true
-        }
         guard let win = tab.windows.first else { return nil }
         return tabResourceCache[win.pid]
     }
