@@ -1,4 +1,5 @@
 import Cocoa
+import Darwin
 
 // MARK: - Kitty Data Models
 
@@ -152,6 +153,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 }
                 return (state, sessions, resources)
             }
+
+            // Return malloc's free pages to the OS
+            malloc_zone_pressure_relief(nil, 0)
 
             DispatchQueue.main.async {
                 self.cachedState = state
