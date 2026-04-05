@@ -880,22 +880,33 @@ class LazyTabMenu: NSMenu, NSMenuDelegate {
         }
 
         // Process tree
-        if let res = resources {
+        if let res = resources, let rootPid = tab.windows.first?.pid {
             let header = NSMenuItem()
             header.isEnabled = false
             header.attributedTitle = ad.styled("Processes", size: 11, color: .secondaryLabelColor)
             addItem(header)
 
-            for proc in res.processes.sorted(by: { $0.rssMB > $1.rssMB }) {
+            // Build parent → children map
+            let procMap = Dictionary(uniqueKeysWithValues: res.processes.map { ($0.pid, $0) })
+            var childrenMap: [Int: [ProcessInfo]] = [:]
+            for proc in res.processes {
+                childrenMap[proc.ppid, default: []].append(proc)
+            }
+
+            // Recursive tree render
+            func addTreeNode(_ pid: Int, prefix: String, isLast: Bool) {
+                guard let proc = procMap[pid] else { return }
                 let rss = ad.formatRSS(proc.rssMB)
                 let cpu = proc.cpu < 0.1 ? "0%" : String(format: "%.1f%%", proc.cpu)
 
+                let connector = isLast ? "└ " : "├ "
                 let procItem = NSMenuItem(title: proc.command, action: #selector(AppDelegate.killProcess(_:)), keyEquivalent: "")
                 procItem.target = ad
                 procItem.tag = proc.pid
 
                 let pAttr = NSMutableAttributedString()
                 let dotColor: NSColor = proc.rssMB > 100 ? .systemRed : proc.rssMB > 10 ? .systemYellow : .tertiaryLabelColor
+                pAttr.append(ad.styled("\(prefix)\(connector)", size: 11, color: .tertiaryLabelColor, mono: true))
                 pAttr.append(ad.styled("● ", size: 8, color: dotColor))
                 pAttr.append(ad.styled(proc.command, size: 12))
                 pAttr.append(ad.styled("  \(rss)  \(cpu)", size: 10, color: .secondaryLabelColor, mono: true))
@@ -903,7 +914,15 @@ class LazyTabMenu: NSMenu, NSMenuDelegate {
                 procItem.attributedTitle = pAttr
                 procItem.toolTip = "Click to send SIGTERM to PID \(proc.pid)"
                 addItem(procItem)
+
+                let kids = childrenMap[pid] ?? []
+                for (i, child) in kids.enumerated() {
+                    let ext = isLast ? "  " : "│ "
+                    addTreeNode(child.pid, prefix: prefix + ext, isLast: i == kids.count - 1)
+                }
             }
+
+            addTreeNode(rootPid, prefix: "", isLast: true)
             addItem(.separator())
         }
 
