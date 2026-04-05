@@ -162,7 +162,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    /// Build resource map (calls ps -eo) — safe to call off main thread.
+    /// Build resource map using a single `ps -eo` call.
+    /// Two-pass: first build pid→ppid tree (lightweight), then only parse full
+    /// info for PIDs in the kitty subtrees.
     private func buildResourceMap(for state: [KittyOSWindow]) -> [Int: TabResources] {
         var shellPids = Set<Int>()
         for osWin in state {
@@ -171,32 +173,61 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
         }
         guard !shellPids.isEmpty,
-              let psOutput = shell("ps", "-eo", "pid=,ppid=,rss=,%cpu=,comm=")
+              let psData = shell("ps", "-eo", "pid=,ppid=,rss=,%cpu=,comm=")?.utf8
         else { return [:] }
+        let psOutput = String(psData)
 
-        var allProcs: [Int: (pid: Int, ppid: Int, rss: Int, cpu: Double, cmd: String)] = [:]
+        // Pass 1: build pid→ppid map and children map (only parse first 2 columns)
+        var ppidOf: [Int: Int] = [:]
         var children: [Int: [Int]] = [:]
+        // Also store each line's range for pass 2
+        var lineRanges: [Int: Substring] = [:]  // pid → full line
+
         for line in psOutput.split(separator: "\n") {
-            let tokens = line.split(omittingEmptySubsequences: true, whereSeparator: { $0 == " " })
-            guard tokens.count >= 5, let pid = Int(tokens[0]), let ppid = Int(tokens[1]),
-                  let rss = Int(tokens[2]), let cpu = Double(tokens[3]) else { continue }
-            allProcs[pid] = (pid, ppid, rss, cpu, tokens[4...].joined(separator: " "))
+            let trimmed = line.drop(while: { $0 == " " })
+            guard let spaceIdx = trimmed.firstIndex(of: " ") else { continue }
+            guard let pid = Int(trimmed[trimmed.startIndex..<spaceIdx]) else { continue }
+
+            let rest = trimmed[spaceIdx...].drop(while: { $0 == " " })
+            guard let spaceIdx2 = rest.firstIndex(of: " ") else { continue }
+            guard let ppid = Int(rest[rest.startIndex..<spaceIdx2]) else { continue }
+
+            ppidOf[pid] = ppid
             children[ppid, default: []].append(pid)
+            lineRanges[pid] = line
         }
 
+        // Find all PIDs in kitty subtrees
         func descendants(of pid: Int) -> [Int] {
             var result = [pid]
             for child in children[pid] ?? [] { result.append(contentsOf: descendants(of: child)) }
             return result
         }
 
+        var relevantPids = Set<Int>()
+        for shellPid in shellPids {
+            for pid in descendants(of: shellPid) { relevantPids.insert(pid) }
+        }
+
+        // Pass 2: full parse only for relevant PIDs (~30 instead of ~1000)
+        var procMap: [Int: ProcessInfo] = [:]
+        for pid in relevantPids {
+            guard let line = lineRanges[pid] else { continue }
+            let tokens = line.split(omittingEmptySubsequences: true, whereSeparator: { $0 == " " })
+            guard tokens.count >= 5,
+                  let rss = Int(tokens[2]),
+                  let cpu = Double(tokens[3]) else { continue }
+            let cmd = tokens[4...].joined(separator: " ")
+            procMap[pid] = ProcessInfo(
+                pid: pid, ppid: ppidOf[pid] ?? 0,
+                rssMB: Double(rss) / 1024, cpu: cpu,
+                command: shortenCommand(cmd)
+            )
+        }
+
         var map: [Int: TabResources] = [:]
         for shellPid in shellPids {
-            let procs = descendants(of: shellPid).compactMap { pid -> ProcessInfo? in
-                guard let r = allProcs[pid] else { return nil }
-                return ProcessInfo(pid: r.pid, ppid: r.ppid, rssMB: Double(r.rss) / 1024,
-                                   cpu: r.cpu, command: shortenCommand(r.cmd))
-            }
+            let procs = descendants(of: shellPid).compactMap { procMap[$0] }
             map[shellPid] = TabResources(processes: procs)
         }
         return map
