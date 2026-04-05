@@ -140,13 +140,17 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func refreshDataInBackground() {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
-            let state = self.fetchKittyState()
-            let sessions = self.loadSessionFiles()
 
-            // Build process tree in background
-            var resources: [Int: TabResources] = [:]
-            if !state.isEmpty {
-                resources = self.buildResourceMap(for: state)
+            // autoreleasepool ensures temporary strings from shell() and parsing
+            // are freed promptly instead of accumulating in malloc's free pool.
+            let (state, sessions, resources) = autoreleasepool { () -> ([KittyOSWindow], [Int: ClaudeSessionFile], [Int: TabResources]) in
+                let state = self.fetchKittyState()
+                let sessions = self.loadSessionFiles()
+                var resources: [Int: TabResources] = [:]
+                if !state.isEmpty {
+                    resources = self.buildResourceMap(for: state)
+                }
+                return (state, sessions, resources)
             }
 
             DispatchQueue.main.async {
