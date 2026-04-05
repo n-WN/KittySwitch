@@ -894,19 +894,21 @@ class LazyTabMenu: NSMenu, NSMenuDelegate {
             }
 
             // Recursive tree render
-            func addTreeNode(_ pid: Int, prefix: String, isLast: Bool) {
+            func addTreeNode(_ pid: Int, prefix: String, isLast: Bool, isRoot: Bool) {
                 guard let proc = procMap[pid] else { return }
                 let rss = ad.formatRSS(proc.rssMB)
                 let cpu = proc.cpu < 0.1 ? "0%" : String(format: "%.1f%%", proc.cpu)
 
-                let connector = isLast ? "└ " : "├ "
+                let connector = isRoot ? "" : (isLast ? "└ " : "├ ")
                 let procItem = NSMenuItem(title: proc.command, action: #selector(AppDelegate.killProcess(_:)), keyEquivalent: "")
                 procItem.target = ad
                 procItem.tag = proc.pid
 
                 let pAttr = NSMutableAttributedString()
                 let dotColor: NSColor = proc.rssMB > 100 ? .systemRed : proc.rssMB > 10 ? .systemYellow : .tertiaryLabelColor
-                pAttr.append(ad.styled("\(prefix)\(connector)", size: 11, color: .tertiaryLabelColor, mono: true))
+                if !connector.isEmpty {
+                    pAttr.append(ad.styled(connector, size: 11, color: .tertiaryLabelColor, mono: true))
+                }
                 pAttr.append(ad.styled("● ", size: 8, color: dotColor))
                 pAttr.append(ad.styled(proc.command, size: 12))
                 pAttr.append(ad.styled("  \(rss)  \(cpu)", size: 10, color: .secondaryLabelColor, mono: true))
@@ -917,12 +919,12 @@ class LazyTabMenu: NSMenu, NSMenuDelegate {
 
                 let kids = childrenMap[pid] ?? []
                 for (i, child) in kids.enumerated() {
-                    let ext = isLast ? "  " : "│ "
-                    addTreeNode(child.pid, prefix: prefix + ext, isLast: i == kids.count - 1)
+                    let ext = isRoot ? "" : (isLast ? "  " : "│ ")
+                    addTreeNode(child.pid, prefix: prefix + ext, isLast: i == kids.count - 1, isRoot: false)
                 }
             }
 
-            addTreeNode(rootPid, prefix: "", isLast: true)
+            addTreeNode(rootPid, prefix: "", isLast: true, isRoot: true)
             addItem(.separator())
         }
 
