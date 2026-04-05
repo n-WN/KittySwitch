@@ -899,15 +899,17 @@ class LazyTabMenu: NSMenu, NSMenuDelegate {
                 let rss = ad.formatRSS(proc.rssMB)
                 let cpu = proc.cpu < 0.1 ? "0%" : String(format: "%.1f%%", proc.cpu)
 
-                let connector = isRoot ? "" : (isLast ? "└ " : "├ ")
+                // Use figure space (U+2007) for indentation — NSMenu strips regular spaces
+                let indent = prefix.replacingOccurrences(of: " ", with: "\u{2007}")
+                let connector = isRoot ? "" : (isLast ? "└\u{2007}" : "├\u{2007}")
                 let procItem = NSMenuItem(title: proc.command, action: #selector(AppDelegate.killProcess(_:)), keyEquivalent: "")
                 procItem.target = ad
                 procItem.tag = proc.pid
 
                 let pAttr = NSMutableAttributedString()
                 let dotColor: NSColor = proc.rssMB > 100 ? .systemRed : proc.rssMB > 10 ? .systemYellow : .tertiaryLabelColor
-                if !connector.isEmpty {
-                    pAttr.append(ad.styled(connector, size: 11, color: .tertiaryLabelColor, mono: true))
+                if !indent.isEmpty || !connector.isEmpty {
+                    pAttr.append(ad.styled("\(indent)\(connector)", size: 11, color: .tertiaryLabelColor, mono: true))
                 }
                 pAttr.append(ad.styled("● ", size: 8, color: dotColor))
                 pAttr.append(ad.styled(proc.command, size: 12))
@@ -919,9 +921,10 @@ class LazyTabMenu: NSMenu, NSMenuDelegate {
 
                 let kids = childrenMap[pid] ?? []
                 for (i, child) in kids.enumerated() {
-                    let ext = isRoot ? "" : (isLast ? "  " : "│ ")
+                    let ext = isLast ? "  " : "│ "
                     addTreeNode(child.pid, prefix: prefix + ext, isLast: i == kids.count - 1, isRoot: false)
                 }
+                // Note: prefix uses regular spaces internally; converted to figure spaces at render time
             }
 
             addTreeNode(rootPid, prefix: "", isLast: true, isRoot: true)
