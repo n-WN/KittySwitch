@@ -87,14 +87,14 @@ struct TabResources {
     var count: Int { processes.count }
 }
 
-struct ClosedTab {
+struct ClosedTab: Codable {
     let title: String
     let cwd: String
     let layout: String
-    let shell: [String]            // original shell cmdline
-    let foregroundCmd: [String]    // what was running (e.g. claude --resume ...)
+    let shell: [String]
+    let foregroundCmd: [String]
     let closedAt: Date
-    let claudeSessionId: String?   // for Claude tabs, enables --resume
+    let claudeSessionId: String?
 }
 
 struct HistorySession {
@@ -148,6 +148,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.delegate = self
         menu.autoenablesItems = false
         statusItem.menu = menu
+        closedTabs = loadClosedTabs()
         refreshDataInBackground()
         startTimer(interval: slowInterval)
     }
@@ -178,14 +179,17 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 // Detect closed tabs by diffing tab IDs
                 let currentIds = Set(state.flatMap { $0.tabs.map(\.id) })
                 if !self.previousTabIds.isEmpty {
+                    var changed = false
                     for tabId in self.previousTabIds.subtracting(currentIds) {
                         if let snapshot = self.previousTabSnapshots[tabId] {
                             self.closedTabs.insert(snapshot, at: 0)
+                            changed = true
                         }
                     }
                     if self.closedTabs.count > self.maxClosedTabs {
                         self.closedTabs = Array(self.closedTabs.prefix(self.maxClosedTabs))
                     }
+                    if changed { self.saveClosedTabs() }
                 }
 
                 // Snapshot current tabs for next diff
@@ -573,6 +577,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         closedTabs.remove(at: idx)
+        saveClosedTabs()
         activateKitty()
     }
 
@@ -900,6 +905,32 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 sizeKB: c.sizeKB
             )
         }
+    }
+
+    // MARK: - Closed Tab Persistence
+
+    private lazy var closedTabsFile: URL = {
+        let dir = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".config/kittyswitch")
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir.appendingPathComponent("closed_tabs.json")
+    }()
+
+    private func saveClosedTabs() {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .secondsSince1970
+        guard let data = try? encoder.encode(closedTabs) else { return }
+        try? data.write(to: closedTabsFile, options: .atomic)
+    }
+
+    private func loadClosedTabs() -> [ClosedTab] {
+        guard let data = try? Data(contentsOf: closedTabsFile) else { return [] }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .secondsSince1970
+        guard let tabs = try? decoder.decode([ClosedTab].self, from: data) else { return [] }
+        // Expire entries older than 7 days
+        let cutoff = Date().addingTimeInterval(-7 * 86400)
+        return tabs.filter { $0.closedAt > cutoff }
     }
 
     // MARK: - Process Resources
