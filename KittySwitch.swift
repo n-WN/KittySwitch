@@ -58,18 +58,15 @@ struct SessionMeta {
     let firstPrompt: String
     let lastPrompt: String
     let cwd: String
-
     static let empty = SessionMeta(firstPrompt: "", lastPrompt: "", cwd: "")
 }
 
+/// Lightweight Claude detection result — no I/O, just IDs and args.
 struct ClaudeInfo {
-    let sessionId: String       // current session ID (from session file)
-    let jsonlSessionId: String  // ID that maps to the .jsonl filename
+    let sessionId: String
+    let jsonlSessionId: String
     let pid: Int
     let args: [String]
-    let meta: SessionMeta
-    let startedAt: Date
-    let messageCount: Int
 }
 
 struct ProcessInfo {
@@ -113,14 +110,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var refreshTimer: Timer?
 
     private var cachedState: [KittyOSWindow] = []
-    private var previousTabIds = Set<Int>()   // tab IDs from last refresh (for diff)
-    private var previousTabSnapshots: [Int: ClosedTab] = [:]  // tab ID → snapshot (for restore)
-    private var closedTabs: [ClosedTab] = []  // recently closed, newest first
+    private var previousTabIds = Set<Int>()
+    private var previousTabSnapshots: [Int: ClosedTab] = [:]
+    private var closedTabs: [ClosedTab] = []
     private let maxClosedTabs = 20
 
     private var sessionFileCache: [Int: ClaudeSessionFile] = [:]
     private var sessionMetaCache: [String: SessionMeta] = [:]
-    private var messageCountCache: [String: Int] = [:]
     private var tabResourceCache: [Int: TabResources] = [:]
 
     let slowInterval: TimeInterval = 5.0
@@ -155,118 +151,102 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // MARK: - Background Data Refresh
 
-    /// Refresh data in background so menu opens instantly from cache.
     private func refreshDataInBackground() {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
 
-            // autoreleasepool ensures temporary strings from shell() and parsing
-            // are freed promptly instead of accumulating in malloc's free pool.
-            let (state, sessions, resources) = autoreleasepool { () -> ([KittyOSWindow], [Int: ClaudeSessionFile], [Int: TabResources]) in
+            let (state, sessions, resources) = autoreleasepool {
+                () -> ([KittyOSWindow], [Int: ClaudeSessionFile], [Int: TabResources]) in
                 let state = self.fetchKittyState()
                 let sessions = self.loadSessionFiles()
-                var resources: [Int: TabResources] = [:]
-                if !state.isEmpty {
-                    resources = self.buildResourceMap(for: state)
-                }
+                let resources = state.isEmpty ? [:] : self.buildResourceMap(for: state)
                 return (state, sessions, resources)
             }
-
-            // Return malloc's free pages to the OS
             malloc_zone_pressure_relief(nil, 0)
 
             DispatchQueue.main.async {
-                // Detect closed tabs by diffing tab IDs
-                let currentIds = Set(state.flatMap { $0.tabs.map(\.id) })
-                if !self.previousTabIds.isEmpty {
-                    var changed = false
-                    for tabId in self.previousTabIds.subtracting(currentIds) {
-                        if let snapshot = self.previousTabSnapshots[tabId] {
-                            self.closedTabs.insert(snapshot, at: 0)
-                            changed = true
-                        }
-                    }
-                    if self.closedTabs.count > self.maxClosedTabs {
-                        self.closedTabs = Array(self.closedTabs.prefix(self.maxClosedTabs))
-                    }
-                    if changed { self.saveClosedTabs() }
-                }
-
-                // Snapshot current tabs for next diff
-                self.previousTabIds = currentIds
-                self.previousTabSnapshots = [:]
-                for osWin in state {
-                    for tab in osWin.tabs {
-                        guard let win = tab.windows.first else { continue }
-                        let fgClaude = win.foregroundProcesses.first {
-                            $0.cmdline.contains { $0 == "claude" || $0.hasSuffix("/claude") }
-                        }
-                        var claudeId: String?
-                        if let fg = fgClaude {
-                            if let sf = sessions[fg.pid] { claudeId = sf.sessionId }
-                            else if let ri = fg.cmdline.firstIndex(of: "--resume"),
-                                    ri + 1 < fg.cmdline.count,
-                                    fg.cmdline[ri + 1].count > 30 {
-                                claudeId = fg.cmdline[ri + 1]
-                            }
-                        }
-                        self.previousTabSnapshots[tab.id] = ClosedTab(
-                            title: tab.title, cwd: win.cwd, layout: tab.layout,
-                            shell: win.cmdline,
-                            foregroundCmd: fgClaude?.cmdline ?? [],
-                            closedAt: Date(), claudeSessionId: claudeId
-                        )
-                    }
-                }
-
+                self.detectClosedTabs(newState: state, sessions: sessions)
+                self.snapshotTabs(state: state, sessions: sessions)
                 self.cachedState = state
                 self.sessionFileCache = sessions
                 self.tabResourceCache = resources
                 self.sessionMetaCache = [:]
-                self.messageCountCache = [:]
-
-                let tabCount = state.reduce(0) { $0 + $1.tabs.count }
-                self.statusItem.button?.title = " \(tabCount)"
+                self.statusItem.button?.title = " \(state.reduce(0) { $0 + $1.tabs.count })"
             }
         }
     }
 
-    /// Build resource map using a single `ps -eo` call.
-    /// Two-pass: first build pid→ppid tree (lightweight), then only parse full
-    /// info for PIDs in the kitty subtrees.
-    private func buildResourceMap(for state: [KittyOSWindow]) -> [Int: TabResources] {
-        var shellPids = Set<Int>()
-        for osWin in state {
-            for tab in osWin.tabs {
-                for win in tab.windows { shellPids.insert(win.pid) }
+    private func detectClosedTabs(newState: [KittyOSWindow], sessions: [Int: ClaudeSessionFile]) {
+        let currentIds = Set(newState.flatMap { $0.tabs.map(\.id) })
+        guard !previousTabIds.isEmpty else { return }
+
+        var changed = false
+        for tabId in previousTabIds.subtracting(currentIds) {
+            if let snapshot = previousTabSnapshots[tabId] {
+                closedTabs.insert(snapshot, at: 0)
+                changed = true
             }
         }
-        guard !shellPids.isEmpty,
-              let psData = shell("ps", "-eo", "pid=,ppid=,rss=,%cpu=,comm=")?.utf8
-        else { return [:] }
-        let psOutput = String(psData)
+        if closedTabs.count > maxClosedTabs {
+            closedTabs = Array(closedTabs.prefix(maxClosedTabs))
+        }
+        if changed { saveClosedTabs() }
+    }
 
-        // Pass 1: build pid→ppid map and children map (only parse first 2 columns)
+    private func snapshotTabs(state: [KittyOSWindow], sessions: [Int: ClaudeSessionFile]) {
+        previousTabIds = Set(state.flatMap { $0.tabs.map(\.id) })
+        previousTabSnapshots = [:]
+        for osWin in state {
+            for tab in osWin.tabs {
+                guard let win = tab.windows.first else { continue }
+                let claudeId = findClaudeSessionId(in: win, sessions: sessions)
+                let fgCmd = win.foregroundProcesses.first {
+                    $0.cmdline.contains { $0 == "claude" || $0.hasSuffix("/claude") }
+                }?.cmdline ?? []
+                previousTabSnapshots[tab.id] = ClosedTab(
+                    title: tab.title, cwd: win.cwd, layout: tab.layout,
+                    shell: win.cmdline, foregroundCmd: fgCmd,
+                    closedAt: Date(), claudeSessionId: claudeId
+                )
+            }
+        }
+    }
+
+    /// Shared Claude detection: find session ID from a kitty window's foreground processes.
+    private func findClaudeSessionId(in win: KittyWindow, sessions: [Int: ClaudeSessionFile]) -> String? {
+        for proc in win.foregroundProcesses {
+            guard proc.cmdline.contains(where: { $0 == "claude" || $0.hasSuffix("/claude") })
+            else { continue }
+            if let sf = sessions[proc.pid] { return sf.sessionId }
+            if let ri = proc.cmdline.firstIndex(of: "--resume"), ri + 1 < proc.cmdline.count,
+               proc.cmdline[ri + 1].count > 30, proc.cmdline[ri + 1].contains("-") {
+                return proc.cmdline[ri + 1]
+            }
+        }
+        return nil
+    }
+
+    private func buildResourceMap(for state: [KittyOSWindow]) -> [Int: TabResources] {
+        var shellPids = Set<Int>()
+        for osWin in state { for tab in osWin.tabs { for win in tab.windows { shellPids.insert(win.pid) } } }
+        guard !shellPids.isEmpty,
+              let psOutput = shell("ps", "-eo", "pid=,ppid=,rss=,%cpu=,comm=")
+        else { return [:] }
+
         var ppidOf: [Int: Int] = [:]
         var children: [Int: [Int]] = [:]
-        // Also store each line's range for pass 2
-        var lineRanges: [Int: Substring] = [:]  // pid → full line
+        var lineRanges: [Int: Substring] = [:]
 
         for line in psOutput.split(separator: "\n") {
             let trimmed = line.drop(while: { $0 == " " })
-            guard let spaceIdx = trimmed.firstIndex(of: " ") else { continue }
-            guard let pid = Int(trimmed[trimmed.startIndex..<spaceIdx]) else { continue }
-
-            let rest = trimmed[spaceIdx...].drop(while: { $0 == " " })
-            guard let spaceIdx2 = rest.firstIndex(of: " ") else { continue }
-            guard let ppid = Int(rest[rest.startIndex..<spaceIdx2]) else { continue }
-
+            guard let si = trimmed.firstIndex(of: " "), let pid = Int(trimmed[..<si]) else { continue }
+            let rest = trimmed[si...].drop(while: { $0 == " " })
+            guard let si2 = rest.firstIndex(of: " "), let ppid = Int(rest[..<si2]) else { continue }
             ppidOf[pid] = ppid
             children[ppid, default: []].append(pid)
             lineRanges[pid] = line
         }
 
-        // Find all PIDs in kitty subtrees
         func descendants(of pid: Int) -> [Int] {
             var result = [pid]
             for child in children[pid] ?? [] { result.append(contentsOf: descendants(of: child)) }
@@ -274,31 +254,20 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         var relevantPids = Set<Int>()
-        for shellPid in shellPids {
-            for pid in descendants(of: shellPid) { relevantPids.insert(pid) }
-        }
+        for shellPid in shellPids { for pid in descendants(of: shellPid) { relevantPids.insert(pid) } }
 
-        // Pass 2: full parse only for relevant PIDs (~30 instead of ~1000)
         var procMap: [Int: ProcessInfo] = [:]
         for pid in relevantPids {
             guard let line = lineRanges[pid] else { continue }
             let tokens = line.split(omittingEmptySubsequences: true, whereSeparator: { $0 == " " })
-            guard tokens.count >= 5,
-                  let rss = Int(tokens[2]),
-                  let cpu = Double(tokens[3]) else { continue }
-            let cmd = tokens[4...].joined(separator: " ")
-            procMap[pid] = ProcessInfo(
-                pid: pid, ppid: ppidOf[pid] ?? 0,
-                rssMB: Double(rss) / 1024, cpu: cpu,
-                command: shortenCommand(cmd)
-            )
+            guard tokens.count >= 5, let rss = Int(tokens[2]), let cpu = Double(tokens[3]) else { continue }
+            procMap[pid] = ProcessInfo(pid: pid, ppid: ppidOf[pid] ?? 0,
+                                       rssMB: Double(rss) / 1024, cpu: cpu,
+                                       command: shortenCommand(tokens[4...].joined(separator: " ")))
         }
 
         var map: [Int: TabResources] = [:]
-        for shellPid in shellPids {
-            let procs = descendants(of: shellPid).compactMap { procMap[$0] }
-            map[shellPid] = TabResources(processes: procs)
-        }
+        for shellPid in shellPids { map[shellPid] = TabResources(processes: descendants(of: shellPid).compactMap { procMap[$0] }) }
         return map
     }
 
@@ -314,9 +283,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // MARK: - NSMenuDelegate
 
     func menuNeedsUpdate(_ menu: NSMenu) {
-        // Build menu instantly from cached data (0 ms)
         rebuildMenuFromCache()
-        // Kick off a fresh background refresh for next open
         refreshDataInBackground()
         startTimer(interval: fastInterval)
     }
@@ -333,8 +300,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         buildClosedSection()
         buildHistorySection()
         buildFooter()
-        let tabCount = cachedState.reduce(0) { $0 + $1.tabs.count }
-        statusItem.button?.title = " \(tabCount)"
     }
 
     private func buildActiveSection() {
@@ -349,76 +314,60 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         for (i, osWin) in cachedState.enumerated() {
             if cachedState.count > 1 {
                 if i > 0 { addSeparator() }
-                let suffix = osWin.isActive ? "  (active)" : ""
-                addLabel("Window \(i + 1)\(suffix)", bold: true, size: 12)
+                addLabel("Window \(i + 1)\(osWin.isActive ? "  (active)" : "")", bold: true, size: 12)
             }
-            for tab in osWin.tabs {
-                addTabItem(tab)
-            }
+            for tab in osWin.tabs { addTabItem(tab) }
         }
 
         addSeparator()
         let total = cachedState.reduce(0) { $0 + $1.tabs.count }
         let totalRSS = tabResourceCache.values.reduce(0.0) { $0 + $1.totalRSS }
         let totalCPU = tabResourceCache.values.reduce(0.0) { $0 + $1.totalCPU }
-        let rssStr = totalRSS >= 1024 ? String(format: "%.1f GB", totalRSS / 1024) : String(format: "%.0f MB", totalRSS)
-        addLabel("\(total) tabs  ·  \(rssStr)  ·  \(String(format: "%.1f", totalCPU))% CPU")
+        addLabel("\(total) tabs  ·  \(formatRSS(totalRSS))  ·  \(String(format: "%.1f", totalCPU))% CPU")
+
+        statusItem.button?.title = " \(total)"
     }
 
     private func addTabItem(_ tab: KittyTab) {
         let info = extractClaudeInfo(from: tab)
         let title = truncate(tab.title, to: 50)
         let cwd = tab.windows.first.map { shortenPath($0.cwd) } ?? ""
+        let res = tabResourceCache[tab.windows.first?.pid ?? 0]
 
         let item = NSMenuItem(title: title, action: #selector(focusTab(_:)), keyEquivalent: "")
         item.target = self
         item.tag = tab.id
         item.state = tab.isActive ? .on : .off
 
-        // Main line: icon + title + cwd + resource summary (from cache, no I/O)
-        let res = resourcesForTab(tab)
         let attr = NSMutableAttributedString()
         if info != nil { attr.append(styled("◆ ", size: 13, color: .systemOrange)) }
         attr.append(styled(title, size: 13))
         attr.append(styled("  \(cwd)", size: 11, color: .secondaryLabelColor))
         if let res {
             let color: NSColor = res.totalRSS > 500 ? .systemOrange : .tertiaryLabelColor
-            attr.append(styled("  \(formatResourceSummary(res))", size: 10, color: color, mono: true))
+            attr.append(styled("  \(formatRSS(res.totalRSS))  \(res.count)p", size: 10, color: color, mono: true))
         }
         item.attributedTitle = attr
-
-        // Lazy submenu — content built on hover, not during main menu construction
-        let sub = LazyTabMenu(appDelegate: self, tab: tab, claudeInfo: info, resources: res)
-        item.submenu = sub
+        item.submenu = LazyTabMenu(appDelegate: self, tab: tab, claudeInfo: info, resources: res)
         menu.addItem(item)
     }
 
     private func buildClosedSection() {
         guard !closedTabs.isEmpty else { return }
-
         addSeparator()
         addLabel("Recently Closed", bold: true, size: 12)
         addSeparator()
 
         let fmt = DateFormatter()
         fmt.dateFormat = "HH:mm"
-
         for (i, closed) in closedTabs.prefix(8).enumerated() {
-            let title = truncate(closed.title, to: 45)
-            let time = fmt.string(from: closed.closedAt)
-            let cwd = shortenPath(closed.cwd)
-            let isClaude = closed.claudeSessionId != nil
-
-            let item = NSMenuItem(title: title, action: #selector(restoreClosedTab(_:)), keyEquivalent: "")
+            let item = NSMenuItem(title: closed.title, action: #selector(restoreClosedTab(_:)), keyEquivalent: "")
             item.target = self
             item.tag = i
-
             let attr = NSMutableAttributedString()
-            if isClaude {
-                attr.append(styled("◆ ", size: 12, color: .systemOrange))
-            }
-            attr.append(styled(title, size: 12))
-            attr.append(styled("  \(cwd)  \(time)", size: 10, color: .tertiaryLabelColor))
+            if closed.claudeSessionId != nil { attr.append(styled("◆ ", size: 12, color: .systemOrange)) }
+            attr.append(styled(truncate(closed.title, to: 45), size: 12))
+            attr.append(styled("  \(shortenPath(closed.cwd))  \(fmt.string(from: closed.closedAt))", size: 10, color: .tertiaryLabelColor))
             item.attributedTitle = attr
             menu.addItem(item)
         }
@@ -439,54 +388,37 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         let fmt = DateFormatter()
         fmt.dateFormat = "MM-dd HH:mm"
-
         for session in history.prefix(10) {
             let prompt = session.meta.firstPrompt.isEmpty ? "(no prompt)" : truncate(session.meta.firstPrompt, to: 40)
-            let time = fmt.string(from: session.lastModified)
-            let cwd = shortenPath(session.meta.cwd)
-            let size = session.sizeKB > 1024
-                ? String(format: "%.1fMB", Double(session.sizeKB) / 1024)
-                : "\(session.sizeKB)KB"
-
             let item = NSMenuItem(title: prompt, action: nil, keyEquivalent: "")
 
             let attr = NSMutableAttributedString()
             attr.append(styled("↻ ", size: 12, color: .systemBlue))
             attr.append(styled(prompt, size: 12))
-            attr.append(styled("  \(time)  \(session.messageCount) msgs", size: 10, color: .tertiaryLabelColor))
+            attr.append(styled("  \(fmt.string(from: session.lastModified))  \(session.messageCount) msgs", size: 10, color: .tertiaryLabelColor))
             item.attributedTitle = attr
 
-            // Submenu: info + resume actions
             let sub = NSMenu()
-
-            // Session ID — click to copy
             let idItem = NSMenuItem(title: session.sessionId, action: #selector(copyText(_:)), keyEquivalent: "")
             idItem.target = self
             idItem.representedObject = session.sessionId
-            idItem.toolTip = "Click to copy session ID"
             idItem.attributedTitle = styled("⏣  \(session.sessionId)", size: 10, color: .secondaryLabelColor, mono: true)
             sub.addItem(idItem)
 
             let cwdLabel = NSMenuItem()
             cwdLabel.isEnabled = false
-            cwdLabel.attributedTitle = styled("  \(cwd)  ·  \(size)", size: 10, color: .tertiaryLabelColor)
+            let size = session.sizeKB > 1024 ? String(format: "%.1fMB", Double(session.sizeKB) / 1024) : "\(session.sizeKB)KB"
+            cwdLabel.attributedTitle = styled("  \(shortenPath(session.meta.cwd))  ·  \(size)", size: 10, color: .tertiaryLabelColor)
             sub.addItem(cwdLabel)
-
             sub.addItem(.separator())
 
-            // Resume actions
-            let normalItem = NSMenuItem(title: "Resume", action: #selector(resumeSession(_:)), keyEquivalent: "")
-            normalItem.target = self
-            normalItem.representedObject = ResumeInfo(sessionId: session.sessionId, cwd: session.meta.cwd, dangerousMode: false)
-            normalItem.attributedTitle = styled("▶  Resume", size: 12)
-            sub.addItem(normalItem)
-
-            let dangerItem = NSMenuItem(title: "Resume (skip permissions)", action: #selector(resumeSession(_:)), keyEquivalent: "")
-            dangerItem.target = self
-            dangerItem.representedObject = ResumeInfo(sessionId: session.sessionId, cwd: session.meta.cwd, dangerousMode: true)
-            dangerItem.attributedTitle = styled("  Resume (skip permissions)", size: 12, color: .systemOrange)
-            sub.addItem(dangerItem)
-
+            for (title, danger) in [("▶  Resume", false), ("  Resume (skip permissions)", true)] {
+                let ri = NSMenuItem(title: title, action: #selector(resumeSession(_:)), keyEquivalent: "")
+                ri.target = self
+                ri.representedObject = ResumeInfo(sessionId: session.sessionId, cwd: session.meta.cwd, dangerousMode: danger)
+                ri.attributedTitle = styled(title, size: 12, color: danger ? .systemOrange : nil)
+                sub.addItem(ri)
+            }
             item.submenu = sub
             menu.addItem(item)
         }
@@ -504,14 +436,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func addLabel(_ title: String, bold: Bool = false, size: CGFloat = 13) {
         let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
         item.isEnabled = false
-        let font = bold ? NSFont.boldSystemFont(ofSize: size) : NSFont.systemFont(ofSize: size)
-        item.attributedTitle = NSAttributedString(string: title, attributes: [.font: font])
+        item.attributedTitle = NSAttributedString(string: title, attributes: [
+            .font: bold ? NSFont.boldSystemFont(ofSize: size) : NSFont.systemFont(ofSize: size)
+        ])
         menu.addItem(item)
     }
 
-    private func addSeparator() {
-        menu.addItem(.separator())
-    }
+    private func addSeparator() { menu.addItem(.separator()) }
 
     func styled(_ text: String, size: CGFloat, color: NSColor? = nil, mono: Bool = false) -> NSAttributedString {
         var attrs: [NSAttributedString.Key: Any] = [
@@ -528,9 +459,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let cwd: String
         let dangerousMode: Bool
         init(sessionId: String, cwd: String, dangerousMode: Bool) {
-            self.sessionId = sessionId
-            self.cwd = cwd
-            self.dangerousMode = dangerousMode
+            self.sessionId = sessionId; self.cwd = cwd; self.dangerousMode = dangerousMode
         }
     }
 
@@ -542,14 +471,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func resumeSession(_ sender: NSMenuItem) {
         guard let info = sender.representedObject as? ResumeInfo else { return }
         let cwd = info.cwd.isEmpty ? FileManager.default.homeDirectoryForCurrentUser.path : info.cwd
-
-        var launchArgs = ["kitty", "@", "launch", "--type=tab", "--cwd=\(cwd)", "claude"]
-        if info.dangerousMode {
-            launchArgs.append("--dangerously-skip-permissions")
-        }
-        launchArgs.append(contentsOf: ["--resume", info.sessionId])
-
-        shell(launchArgs)
+        var args = ["kitty", "@", "launch", "--type=tab", "--cwd=\(cwd)", "claude"]
+        if info.dangerousMode { args.append("--dangerously-skip-permissions") }
+        args.append(contentsOf: ["--resume", info.sessionId])
+        shell(args)
         activateKitty()
     }
 
@@ -559,23 +484,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let closed = closedTabs[idx]
 
         if let sessionId = closed.claudeSessionId {
-            // Claude tab: resume session
-            shell("kitty", "@", "launch", "--type=tab",
-                  "--cwd=\(closed.cwd)",
-                  "claude", "--dangerously-skip-permissions",
-                  "--resume", sessionId)
+            shell("kitty", "@", "launch", "--type=tab", "--cwd=\(closed.cwd)",
+                  "claude", "--dangerously-skip-permissions", "--resume", sessionId)
         } else if !closed.foregroundCmd.isEmpty {
-            // Had a foreground command: restore it
-            var args = ["kitty", "@", "launch", "--type=tab", "--cwd=\(closed.cwd)"]
-            args.append(contentsOf: closed.foregroundCmd)
-            shell(args)
+            shell(["kitty", "@", "launch", "--type=tab", "--cwd=\(closed.cwd)"] + closed.foregroundCmd)
         } else {
-            // Plain shell tab: open shell in the same cwd
-            var args = ["kitty", "@", "launch", "--type=tab", "--cwd=\(closed.cwd)"]
-            args.append(contentsOf: closed.shell.isEmpty ? ["/bin/zsh"] : closed.shell)
-            shell(args)
+            shell(["kitty", "@", "launch", "--type=tab", "--cwd=\(closed.cwd)"] + (closed.shell.isEmpty ? ["/bin/zsh"] : closed.shell))
         }
-
         closedTabs.remove(at: idx)
         saveClosedTabs()
         activateKitty()
@@ -588,18 +503,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc func killProcess(_ sender: NSMenuItem) {
-        let pid = sender.tag
-        guard pid > 0 else { return }
-        kill(Int32(pid), SIGTERM)
+        guard sender.tag > 0 else { return }
+        kill(Int32(sender.tag), SIGTERM)
     }
 
     @objc func closeKittyTab(_ sender: NSMenuItem) {
         shell("kitty", "@", "close-tab", "--match", "id:\(sender.tag)")
     }
 
-    @objc func quitApp() {
-        NSApplication.shared.terminate(nil)
-    }
+    @objc func quitApp() { NSApplication.shared.terminate(nil) }
 
     private func activateKitty() {
         NSRunningApplication.runningApplications(withBundleIdentifier: "net.kovidgoyal.kitty").first?.activate()
@@ -609,24 +521,20 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func fetchKittyState() -> [KittyOSWindow] {
         guard let output = shell("kitty", "@", "ls"), !output.isEmpty,
-              let data = output.data(using: .utf8)
-        else { return [] }
+              let data = output.data(using: .utf8) else { return [] }
         return (try? JSONDecoder().decode([KittyOSWindow].self, from: data)) ?? []
     }
 
     // MARK: - Claude Session Detection
 
     private func loadSessionFiles() -> [Int: ClaudeSessionFile] {
-        guard let files = try? FileManager.default.contentsOfDirectory(
-            at: claudeSessionsDir, includingPropertiesForKeys: nil
-        ) else { return [:] }
-
+        guard let files = try? FileManager.default.contentsOfDirectory(at: claudeSessionsDir, includingPropertiesForKeys: nil)
+        else { return [:] }
         var map: [Int: ClaudeSessionFile] = [:]
         for file in files where file.pathExtension == "json" {
             guard let data = try? Data(contentsOf: file),
-                  let session = try? JSONDecoder().decode(ClaudeSessionFile.self, from: data)
-            else { continue }
-            map[session.pid] = session
+                  let sf = try? JSONDecoder().decode(ClaudeSessionFile.self, from: data) else { continue }
+            map[sf.pid] = sf
         }
         return map
     }
@@ -636,50 +544,22 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             for proc in win.foregroundProcesses {
                 guard let idx = proc.cmdline.firstIndex(where: { $0 == "claude" || $0.hasSuffix("/claude") })
                 else { continue }
-
                 let args = Array(proc.cmdline[(idx + 1)...])
 
-                var sessionId: String?
-                var jsonlId: String?
-                var startedAt: Date?
+                let sessionId = sessionFileCache[proc.pid]?.sessionId
+                let resumeArg: String? = {
+                    guard let ri = args.firstIndex(of: "--resume"), ri + 1 < args.count,
+                          args[ri + 1].count > 30, args[ri + 1].contains("-") else { return nil }
+                    return args[ri + 1]
+                }()
 
-                // Session file gives us the current (possibly new) session ID
-                if let sf = sessionFileCache[proc.pid] {
-                    sessionId = sf.sessionId
-                    startedAt = Date(timeIntervalSince1970: Double(sf.startedAt) / 1000)
+                var jsonlId = [resumeArg, sessionId].compactMap { $0 }.first {
+                    FileManager.default.fileExists(atPath: claudeProjectsDir.appendingPathComponent("\($0).jsonl").path)
                 }
+                if jsonlId == nil, let sid = sessionId { jsonlId = findJsonlForSession(sid) }
 
-                // --resume arg gives us the original session ID (= JSONL filename)
-                if let ri = args.firstIndex(of: "--resume"), ri + 1 < args.count,
-                   args[ri + 1].count > 30, args[ri + 1].contains("-") {
-                    jsonlId = args[ri + 1]
-                }
-
-                // Resolve JSONL ID: --resume arg > session file ID > scan by content
-                var resolvedJsonlId = [jsonlId, sessionId].compactMap { $0 }.first {
-                    FileManager.default.fileExists(atPath:
-                        claudeProjectsDir.appendingPathComponent("\($0).jsonl").path)
-                }
-
-                // For auto-resume, search all project dirs
-                if resolvedJsonlId == nil, let sid = sessionId {
-                    resolvedJsonlId = findJsonlForSession(sid)
-                }
-
-                // Still not found: will be resolved by mtime matching in a post-pass
-                // Store unresolved sessions for later
-
-                guard let sid = sessionId ?? jsonlId else { continue }
-
-                return ClaudeInfo(
-                    sessionId: sid,
-                    jsonlSessionId: resolvedJsonlId ?? sid,
-                    pid: proc.pid,
-                    args: args,
-                    meta: .empty,
-                    startedAt: startedAt ?? Date(),
-                    messageCount: 0
-                )
+                guard let sid = sessionId ?? resumeArg else { continue }
+                return ClaudeInfo(sessionId: sid, jsonlSessionId: jsonlId ?? sid, pid: proc.pid, args: args)
             }
         }
         return nil
@@ -688,76 +568,48 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func getActiveSessionIds() -> Set<String> {
         var ids = Set<String>()
         for osWin in cachedState {
-            for tab in osWin.tabs {
-                for win in tab.windows {
-                    for proc in win.foregroundProcesses {
-                        if let sf = sessionFileCache[proc.pid] { ids.insert(sf.sessionId) }
-                    }
-                }
-            }
+            for tab in osWin.tabs { for win in tab.windows { for proc in win.foregroundProcesses {
+                if let sf = sessionFileCache[proc.pid] { ids.insert(sf.sessionId) }
+            } } }
         }
         return ids
     }
 
-    /// Find the JSONL file for a session. Tries:
-    /// 1. Direct filename match in all project dirs
-    /// 2. Mtime-based matching for resumed sessions whose PID file ID differs from JSONL filename
+    /// Find JSONL file: direct match across all project dirs, then mtime-based fallback.
     private func findJsonlForSession(_ targetId: String) -> String? {
-        let projectsBase = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".claude/projects")
-        guard let projectDirs = try? FileManager.default.contentsOfDirectory(
-            at: projectsBase, includingPropertiesForKeys: nil
-        ) else { return nil }
+        let projectsBase = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude/projects")
+        guard let dirs = try? FileManager.default.contentsOfDirectory(at: projectsBase, includingPropertiesForKeys: nil) else { return nil }
 
-        // 1. Direct match
-        for dir in projectDirs {
-            let candidate = dir.appendingPathComponent("\(targetId).jsonl")
-            if FileManager.default.fileExists(atPath: candidate.path) {
-                return targetId
-            }
+        // Direct match
+        for dir in dirs {
+            if FileManager.default.fileExists(atPath: dir.appendingPathComponent("\(targetId).jsonl").path) { return targetId }
         }
 
-        // 2. Mtime-based: find recently-modified JSOJNLs not already claimed by another session
+        // Mtime-based fallback
         let claimedIds = Set(sessionFileCache.values.compactMap { sf -> String? in
-            let path = claudeProjectsDir.appendingPathComponent("\(sf.sessionId).jsonl").path
-            return FileManager.default.fileExists(atPath: path) ? sf.sessionId : nil
+            FileManager.default.fileExists(atPath: claudeProjectsDir.appendingPathComponent("\(sf.sessionId).jsonl").path) ? sf.sessionId : nil
         })
-
-        // Get recent JSONL files sorted by mtime desc
-        guard let jsonls = try? FileManager.default.contentsOfDirectory(
-            at: claudeProjectsDir,
-            includingPropertiesForKeys: [.contentModificationDateKey]
-        ) else { return nil }
-
-        let candidates = jsonls.filter { $0.pathExtension == "jsonl" }
+        guard let jsonls = try? FileManager.default.contentsOfDirectory(at: claudeProjectsDir, includingPropertiesForKeys: [.contentModificationDateKey]) else { return nil }
+        return jsonls.filter { $0.pathExtension == "jsonl" }
             .compactMap { url -> (String, Date)? in
                 let sid = url.deletingPathExtension().lastPathComponent
                 guard !claimedIds.contains(sid),
                       let attrs = try? url.resourceValues(forKeys: [.contentModificationDateKey]),
                       let mtime = attrs.contentModificationDate,
-                      Date().timeIntervalSince(mtime) < 86400  // modified in last 24h
-                else { return nil }
+                      Date().timeIntervalSince(mtime) < 86400 else { return nil }
                 return (sid, mtime)
             }
             .sorted { $0.1 > $1.1 }
-
-        // Return the most recently modified unclaimed JSONL
-        return candidates.first?.0
+            .first?.0
     }
 
-    /// Resolve the project dir that contains a given session's JSONL.
+    /// Resolve JSONL path across all project directories.
     func resolveJsonlPath(sessionId: String) -> URL? {
-        let projectsBase = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".claude/projects")
-        guard let projectDirs = try? FileManager.default.contentsOfDirectory(
-            at: projectsBase, includingPropertiesForKeys: nil
-        ) else { return nil }
-
-        for dir in projectDirs {
-            let candidate = dir.appendingPathComponent("\(sessionId).jsonl")
-            if FileManager.default.fileExists(atPath: candidate.path) {
-                return candidate
-            }
+        let base = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude/projects")
+        guard let dirs = try? FileManager.default.contentsOfDirectory(at: base, includingPropertiesForKeys: nil) else { return nil }
+        for dir in dirs {
+            let p = dir.appendingPathComponent("\(sessionId).jsonl")
+            if FileManager.default.fileExists(atPath: p.path) { return p }
         }
         return nil
     }
@@ -766,50 +618,50 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func readSessionMeta(sessionId: String) -> SessionMeta {
         if let cached = sessionMetaCache[sessionId] { return cached }
-        // Try primary project dir first, then search all dirs
-        let file = resolveJsonlPath(sessionId: sessionId)
-            ?? claudeProjectsDir.appendingPathComponent("\(sessionId).jsonl")
+        let file = resolveJsonlPath(sessionId: sessionId) ?? claudeProjectsDir.appendingPathComponent("\(sessionId).jsonl")
         guard let handle = try? FileHandle(forReadingFrom: file) else { return .empty }
         defer { handle.closeFile() }
 
-        // Read first user message from head (64KB)
         let headChunk = handle.readData(ofLength: 65536)
-        let firstPrompt = extractFirstUserPrompt(from: headChunk)
+        let firstPrompt = extractPrompt(from: headChunk, last: false)
         let cwd = extractCwd(from: headChunk)
 
-        // Read last user message from tail (64KB)
         var lastPrompt = ""
         let fileSize = handle.seekToEndOfFile()
         if fileSize > 65536 {
             handle.seek(toFileOffset: fileSize - 65536)
-            let tailChunk = handle.readData(ofLength: 65536)
-            lastPrompt = extractLastUserPrompt(from: tailChunk)
+            lastPrompt = extractPrompt(from: handle.readData(ofLength: 65536), last: true)
         } else {
-            // Small file — scan the head chunk for the last user message too
-            lastPrompt = extractLastUserPrompt(from: headChunk)
+            lastPrompt = extractPrompt(from: headChunk, last: true)
         }
-        if lastPrompt == firstPrompt { lastPrompt = "" }  // don't repeat
+        if lastPrompt == firstPrompt { lastPrompt = "" }
 
         let result = SessionMeta(firstPrompt: firstPrompt, lastPrompt: lastPrompt, cwd: cwd)
         sessionMetaCache[sessionId] = result
         return result
     }
 
-    private func extractUserPrompt(from obj: [String: Any]) -> String? {
-        guard obj["type"] as? String == "user",
-              let msg = obj["message"] as? [String: Any],
-              let content = msg["content"]
-        else { return nil }
+    /// Extract first or last user prompt from a JSONL chunk.
+    private func extractPrompt(from data: Data, last: Bool) -> String {
+        guard let text = String(data: data, encoding: .utf8) else { return "" }
+        var result = ""
+        for line in text.components(separatedBy: "\n") where !line.isEmpty {
+            guard let d = line.data(using: .utf8),
+                  let obj = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
+                  obj["type"] as? String == "user",
+                  let msg = obj["message"] as? [String: Any],
+                  let content = msg["content"] else { continue }
 
-        if let text = content as? String {
-            return String(text.prefix(80)).trimmingCharacters(in: .whitespacesAndNewlines)
+            let prompt: String
+            if let t = content as? String {
+                prompt = String(t.prefix(80)).trimmingCharacters(in: .whitespacesAndNewlines)
+            } else if let arr = content as? [[String: Any]], let t = arr.first?["text"] as? String {
+                prompt = String(t.prefix(80)).trimmingCharacters(in: .whitespacesAndNewlines)
+            } else { continue }
+
+            if last { result = prompt } else { return prompt }
         }
-        if let arr = content as? [[String: Any]],
-           let first = arr.first,
-           let text = first["text"] as? String {
-            return String(text.prefix(80)).trimmingCharacters(in: .whitespacesAndNewlines)
-        }
-        return nil
+        return result
     }
 
     private func extractCwd(from data: Data) -> String {
@@ -817,131 +669,71 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         for line in text.components(separatedBy: "\n") where !line.isEmpty {
             guard let d = line.data(using: .utf8),
                   let obj = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
-                  obj["type"] as? String == "user"
-            else { continue }
+                  obj["type"] as? String == "user" else { continue }
             return obj["cwd"] as? String ?? ""
         }
         return ""
     }
 
-    private func extractFirstUserPrompt(from data: Data) -> String {
-        guard let text = String(data: data, encoding: .utf8) else { return "" }
-        for line in text.components(separatedBy: "\n") where !line.isEmpty {
-            guard let d = line.data(using: .utf8),
-                  let obj = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
-                  let prompt = extractUserPrompt(from: obj)
-            else { continue }
-            return prompt
-        }
-        return ""
-    }
-
-    private func extractLastUserPrompt(from data: Data) -> String {
-        guard let text = String(data: data, encoding: .utf8) else { return "" }
-        var last = ""
-        for line in text.components(separatedBy: "\n") where !line.isEmpty {
-            guard let d = line.data(using: .utf8),
-                  let obj = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
-                  let prompt = extractUserPrompt(from: obj)
-            else { continue }
-            last = prompt
-        }
-        return last
-    }
-
-    /// Count lines by streaming in 64KB chunks instead of loading the entire file.
     private func countMessages(sessionId: String) -> Int {
-        if let cached = messageCountCache[sessionId] { return cached }
         let file = claudeProjectsDir.appendingPathComponent("\(sessionId).jsonl")
         guard let handle = try? FileHandle(forReadingFrom: file) else { return 0 }
         defer { handle.closeFile() }
-
         var count = 0
         while true {
             let chunk = handle.readData(ofLength: 65536)
             if chunk.isEmpty { break }
-            count += chunk.withUnsafeBytes { buf in
-                buf.reduce(0) { $0 + ($1 == UInt8(ascii: "\n") ? 1 : 0) }
-            }
+            count += chunk.withUnsafeBytes { $0.reduce(0) { $0 + ($1 == UInt8(ascii: "\n") ? 1 : 0) } }
         }
-        messageCountCache[sessionId] = count
         return count
     }
 
     // MARK: - History
 
     private func fetchHistorySessions(excluding active: Set<String>) -> [HistorySession] {
-        guard let files = try? FileManager.default.contentsOfDirectory(
-            at: claudeProjectsDir, includingPropertiesForKeys: [.contentModificationDateKey, .fileSizeKey]
-        ) else { return [] }
+        guard let files = try? FileManager.default.contentsOfDirectory(at: claudeProjectsDir, includingPropertiesForKeys: [.contentModificationDateKey, .fileSizeKey]) else { return [] }
 
-        // First pass: collect candidates with file attributes only (no I/O)
-        struct Candidate {
-            let sid: String
-            let mtime: Date
-            let sizeKB: Int
-        }
+        struct Candidate { let sid: String; let mtime: Date; let sizeKB: Int }
         var candidates: [Candidate] = []
         for file in files where file.pathExtension == "jsonl" {
             let sid = file.deletingPathExtension().lastPathComponent
             guard sid.count > 30, !active.contains(sid),
                   let attrs = try? file.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey]),
-                  let mtime = attrs.contentModificationDate,
-                  let size = attrs.fileSize,
-                  size / 1024 > 10  // skip sub-agents / test sessions
-            else { continue }
+                  let mtime = attrs.contentModificationDate, let size = attrs.fileSize,
+                  size / 1024 > 10 else { continue }
             candidates.append(Candidate(sid: sid, mtime: mtime, sizeKB: size / 1024))
         }
-
-        // Sort by mtime descending, then only read JSONL for the top 10
         candidates.sort { $0.mtime > $1.mtime }
-
-        return candidates.prefix(10).map { c in
-            HistorySession(
-                sessionId: c.sid,
-                meta: readSessionMeta(sessionId: c.sid),
-                lastModified: c.mtime,
-                messageCount: countMessages(sessionId: c.sid),
-                sizeKB: c.sizeKB
-            )
+        return candidates.prefix(10).map {
+            HistorySession(sessionId: $0.sid, meta: readSessionMeta(sessionId: $0.sid),
+                           lastModified: $0.mtime, messageCount: countMessages(sessionId: $0.sid), sizeKB: $0.sizeKB)
         }
     }
 
     // MARK: - Closed Tab Persistence
 
     private lazy var closedTabsFile: URL = {
-        let dir = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".config/kittyswitch")
+        let dir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".config/kittyswitch")
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir.appendingPathComponent("closed_tabs.json")
     }()
 
     private func saveClosedTabs() {
-        let encoder = JSONEncoder()
-        encoder.dateEncodingStrategy = .secondsSince1970
-        guard let data = try? encoder.encode(closedTabs) else { return }
+        let enc = JSONEncoder(); enc.dateEncodingStrategy = .secondsSince1970
+        guard let data = try? enc.encode(closedTabs) else { return }
         try? data.write(to: closedTabsFile, options: .atomic)
     }
 
     private func loadClosedTabs() -> [ClosedTab] {
         guard let data = try? Data(contentsOf: closedTabsFile) else { return [] }
-        let decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .secondsSince1970
-        guard let tabs = try? decoder.decode([ClosedTab].self, from: data) else { return [] }
-        // Expire entries older than 7 days
+        let dec = JSONDecoder(); dec.dateDecodingStrategy = .secondsSince1970
         let cutoff = Date().addingTimeInterval(-7 * 86400)
-        return tabs.filter { $0.closedAt > cutoff }
+        return ((try? dec.decode([ClosedTab].self, from: data)) ?? []).filter { $0.closedAt > cutoff }
     }
 
-    // MARK: - Process Resources
+    // MARK: - Helpers
 
-    // collectAllTabResources moved to buildResourceMap (runs off main thread)
-
-    private func shortenCommand(_ cmd: String) -> String {
-        // "/opt/homebrew/bin/fish" → "fish"
-        let base = (cmd as NSString).lastPathComponent
-        return base.isEmpty ? cmd : base
-    }
+    private func shortenCommand(_ cmd: String) -> String { (cmd as NSString).lastPathComponent }
 
     private func resourcesForTab(_ tab: KittyTab) -> TabResources? {
         guard let win = tab.windows.first else { return nil }
@@ -952,39 +744,20 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         mb < 1 ? "<1MB" : mb >= 1024 ? String(format: "%.1fGB", mb / 1024) : String(format: "%.0fMB", mb)
     }
 
-    private func formatResourceSummary(_ res: TabResources) -> String {
-        let rss = res.totalRSS < 1 ? "<1MB" :
-                  res.totalRSS >= 1024 ? String(format: "%.1fGB", res.totalRSS / 1024) :
-                  String(format: "%.0fMB", res.totalRSS)
-        let cpu = res.totalCPU < 0.1 ? "0%" : String(format: "%.1f%%", res.totalCPU)
-        return "\(rss)  \(cpu)  \(res.count)p"
-    }
-
-    // MARK: - Helpers
-
     @discardableResult
     private func shell(_ args: String...) -> String? { shell(args) }
 
     @discardableResult
     private func shell(_ args: [String]) -> String? {
-        let process = Process()
-        let pipe = Pipe()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-        process.arguments = args
-        process.standardOutput = pipe
-        process.standardError = FileHandle.nullDevice
+        let p = Process(); let pipe = Pipe()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        p.arguments = args; p.standardOutput = pipe; p.standardError = FileHandle.nullDevice
         do {
-            try process.run()
-            // Read BEFORE waitUntilExit to avoid pipe buffer deadlock.
-            // If output > 64KB (pipe buffer), the child blocks on write
-            // while we block on waitUntilExit → deadlock.
+            try p.run()
             let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            process.waitUntilExit()
-            return String(data: data, encoding: .utf8)?
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-        } catch {
-            return nil
-        }
+            p.waitUntilExit()
+            return String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        } catch { return nil }
     }
 
     func truncate(_ text: String, to max: Int) -> String {
@@ -997,23 +770,19 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 }
 
-// MARK: - Lazy Submenu (built on hover, not during main menu construction)
+// MARK: - Lazy Submenu
 
 class LazyTabMenu: NSMenu, NSMenuDelegate {
-    let appDelegate: AppDelegate
+    let ad: AppDelegate
     let tab: KittyTab
     let claudeInfo: ClaudeInfo?
     let resources: TabResources?
     var built = false
 
     init(appDelegate: AppDelegate, tab: KittyTab, claudeInfo: ClaudeInfo?, resources: TabResources?) {
-        self.appDelegate = appDelegate
-        self.tab = tab
-        self.claudeInfo = claudeInfo
-        self.resources = resources
+        self.ad = appDelegate; self.tab = tab; self.claudeInfo = claudeInfo; self.resources = resources
         super.init(title: "")
         self.delegate = self
-        // Placeholder so NSMenu shows the submenu arrow
         addItem(NSMenuItem(title: "Loading...", action: nil, keyEquivalent: ""))
     }
 
@@ -1024,105 +793,82 @@ class LazyTabMenu: NSMenu, NSMenuDelegate {
         built = true
         removeAllItems()
 
-        let ad = appDelegate
-        let italicFont = NSFont(descriptor: NSFont.systemFont(ofSize: 10).fontDescriptor.withSymbolicTraits(.italic), size: 10) ?? NSFont.systemFont(ofSize: 10)
+        let italicFont = NSFont(descriptor: NSFont.systemFont(ofSize: 10).fontDescriptor.withSymbolicTraits(.italic), size: 10)
+            ?? NSFont.systemFont(ofSize: 10)
         let italicAttrs: [NSAttributedString.Key: Any] = [.font: italicFont, .foregroundColor: NSColor.tertiaryLabelColor]
 
         // Session info
         if let info = claudeInfo {
-            let sessionItem = NSMenuItem(title: info.sessionId, action: #selector(AppDelegate.copyText(_:)), keyEquivalent: "")
-            sessionItem.target = ad
-            sessionItem.representedObject = info.sessionId
-            sessionItem.toolTip = "Click to copy session ID"
+            let si = NSMenuItem(title: info.sessionId, action: #selector(AppDelegate.copyText(_:)), keyEquivalent: "")
+            si.target = ad; si.representedObject = info.sessionId; si.toolTip = "Click to copy session ID"
             let sAttr = NSMutableAttributedString()
             sAttr.append(ad.styled("⏣ ", size: 11, color: .systemOrange))
             sAttr.append(ad.styled(info.sessionId, size: 10, color: .secondaryLabelColor, mono: true))
-            sessionItem.attributedTitle = sAttr
-            addItem(sessionItem)
+            si.attributedTitle = sAttr
+            addItem(si)
 
             let flags = info.args.filter { $0.hasPrefix("--") && $0 != "--resume" }
             if !flags.isEmpty {
-                let flagLabel = NSMenuItem()
-                flagLabel.isEnabled = false
-                flagLabel.attributedTitle = ad.styled("  \(flags.joined(separator: " "))", size: 10, color: .tertiaryLabelColor, mono: true)
-                addItem(flagLabel)
+                let fl = NSMenuItem(); fl.isEnabled = false
+                fl.attributedTitle = ad.styled("  \(flags.joined(separator: " "))", size: 10, color: .tertiaryLabelColor, mono: true)
+                addItem(fl)
             }
 
-            // JSONL read happens HERE — only when submenu is opened
             let meta = ad.readSessionMeta(sessionId: info.jsonlSessionId)
             if !meta.firstPrompt.isEmpty {
-                let first = NSMenuItem()
-                first.isEnabled = false
-                first.attributedTitle = NSAttributedString(string: "  first: \(ad.truncate(meta.firstPrompt, to: 45))", attributes: italicAttrs)
-                addItem(first)
+                let mi = NSMenuItem(); mi.isEnabled = false
+                mi.attributedTitle = NSAttributedString(string: "  first: \(ad.truncate(meta.firstPrompt, to: 45))", attributes: italicAttrs)
+                addItem(mi)
             }
             if !meta.lastPrompt.isEmpty {
-                let last = NSMenuItem()
-                last.isEnabled = false
-                last.attributedTitle = NSAttributedString(string: "  last:  \(ad.truncate(meta.lastPrompt, to: 45))", attributes: italicAttrs)
-                addItem(last)
+                let mi = NSMenuItem(); mi.isEnabled = false
+                mi.attributedTitle = NSAttributedString(string: "  last:  \(ad.truncate(meta.lastPrompt, to: 45))", attributes: italicAttrs)
+                addItem(mi)
             }
             addItem(.separator())
         }
 
         // Process tree
         if let res = resources, let rootPid = tab.windows.first?.pid {
-            let header = NSMenuItem()
-            header.isEnabled = false
-            header.attributedTitle = ad.styled("Processes", size: 11, color: .secondaryLabelColor)
-            addItem(header)
+            let hdr = NSMenuItem(); hdr.isEnabled = false
+            hdr.attributedTitle = ad.styled("Processes", size: 11, color: .secondaryLabelColor)
+            addItem(hdr)
 
-            // Build parent → children map
             let procMap = Dictionary(uniqueKeysWithValues: res.processes.map { ($0.pid, $0) })
             var childrenMap: [Int: [ProcessInfo]] = [:]
-            for proc in res.processes {
-                childrenMap[proc.ppid, default: []].append(proc)
-            }
+            for proc in res.processes { childrenMap[proc.ppid, default: []].append(proc) }
 
-            // Recursive tree render
-            func addTreeNode(_ pid: Int, prefix: String, isLast: Bool, isRoot: Bool) {
+            func addNode(_ pid: Int, prefix: String, isLast: Bool, isRoot: Bool) {
                 guard let proc = procMap[pid] else { return }
-                let rss = ad.formatRSS(proc.rssMB)
-                let cpu = proc.cpu < 0.1 ? "0%" : String(format: "%.1f%%", proc.cpu)
-
-                // Use figure space (U+2007) for indentation — NSMenu strips regular spaces
                 let indent = prefix.replacingOccurrences(of: " ", with: "\u{2007}")
                 let connector = isRoot ? "" : (isLast ? "└\u{2007}" : "├\u{2007}")
-                let procItem = NSMenuItem(title: proc.command, action: #selector(AppDelegate.killProcess(_:)), keyEquivalent: "")
-                procItem.target = ad
-                procItem.tag = proc.pid
-
-                let pAttr = NSMutableAttributedString()
+                let rss = ad.formatRSS(proc.rssMB)
+                let cpu = proc.cpu < 0.1 ? "0%" : String(format: "%.1f%%", proc.cpu)
                 let dotColor: NSColor = proc.rssMB > 100 ? .systemRed : proc.rssMB > 10 ? .systemYellow : .tertiaryLabelColor
-                if !indent.isEmpty || !connector.isEmpty {
-                    pAttr.append(ad.styled("\(indent)\(connector)", size: 11, color: .tertiaryLabelColor, mono: true))
-                }
+
+                let pi = NSMenuItem(title: proc.command, action: #selector(AppDelegate.killProcess(_:)), keyEquivalent: "")
+                pi.target = ad; pi.tag = proc.pid; pi.toolTip = "Click to send SIGTERM to PID \(proc.pid)"
+                let pAttr = NSMutableAttributedString()
+                if !indent.isEmpty || !connector.isEmpty { pAttr.append(ad.styled("\(indent)\(connector)", size: 11, color: .tertiaryLabelColor, mono: true)) }
                 pAttr.append(ad.styled("● ", size: 8, color: dotColor))
                 pAttr.append(ad.styled(proc.command, size: 12))
                 pAttr.append(ad.styled("  \(rss)  \(cpu)", size: 10, color: .secondaryLabelColor, mono: true))
                 pAttr.append(ad.styled("  \(proc.pid)", size: 9, color: .tertiaryLabelColor, mono: true))
-                procItem.attributedTitle = pAttr
-                procItem.toolTip = "Click to send SIGTERM to PID \(proc.pid)"
-                addItem(procItem)
+                pi.attributedTitle = pAttr
+                addItem(pi)
 
-                let kids = childrenMap[pid] ?? []
-                for (i, child) in kids.enumerated() {
-                    let ext = isLast ? "  " : "│ "
-                    addTreeNode(child.pid, prefix: prefix + ext, isLast: i == kids.count - 1, isRoot: false)
+                for (i, child) in (childrenMap[pid] ?? []).enumerated() {
+                    addNode(child.pid, prefix: prefix + (isLast ? "  " : "│ "), isLast: i == (childrenMap[pid]?.count ?? 1) - 1, isRoot: false)
                 }
-                // Note: prefix uses regular spaces internally; converted to figure spaces at render time
             }
-
-            addTreeNode(rootPid, prefix: "", isLast: true, isRoot: true)
+            addNode(rootPid, prefix: "", isLast: true, isRoot: true)
             addItem(.separator())
         }
 
-        // Close tab
-        let closeTab = NSMenuItem(title: "Close Tab", action: #selector(AppDelegate.closeKittyTab(_:)), keyEquivalent: "")
-        closeTab.target = ad
-        closeTab.tag = tab.id
-        closeTab.attributedTitle = ad.styled("✕  Close Tab", size: 12, color: .systemRed)
-        addItem(closeTab)
+        let ct = NSMenuItem(title: "Close Tab", action: #selector(AppDelegate.closeKittyTab(_:)), keyEquivalent: "")
+        ct.target = ad; ct.tag = tab.id
+        ct.attributedTitle = ad.styled("✕  Close Tab", size: 12, color: .systemRed)
+        addItem(ct)
     }
 }
 
