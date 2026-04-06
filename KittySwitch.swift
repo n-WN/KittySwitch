@@ -18,10 +18,11 @@ struct KittyTab: Codable {
     let id: Int
     let title: String
     let isActive: Bool
+    let layout: String
     let windows: [KittyWindow]
 
     enum CodingKeys: String, CodingKey {
-        case id, title, windows
+        case id, title, layout, windows
         case isActive = "is_active"
     }
 }
@@ -30,10 +31,11 @@ struct KittyWindow: Codable {
     let id: Int
     let pid: Int
     let cwd: String
+    let cmdline: [String]
     let foregroundProcesses: [FGProcess]
 
     enum CodingKeys: String, CodingKey {
-        case id, pid, cwd
+        case id, pid, cwd, cmdline
         case foregroundProcesses = "foreground_processes"
     }
 }
@@ -85,6 +87,16 @@ struct TabResources {
     var count: Int { processes.count }
 }
 
+struct ClosedTab {
+    let title: String
+    let cwd: String
+    let layout: String
+    let shell: [String]            // original shell cmdline
+    let foregroundCmd: [String]    // what was running (e.g. claude --resume ...)
+    let closedAt: Date
+    let claudeSessionId: String?   // for Claude tabs, enables --resume
+}
+
 struct HistorySession {
     let sessionId: String
     let meta: SessionMeta
@@ -101,10 +113,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var refreshTimer: Timer?
 
     private var cachedState: [KittyOSWindow] = []
+    private var previousTabIds = Set<Int>()   // tab IDs from last refresh (for diff)
+    private var previousTabSnapshots: [Int: ClosedTab] = [:]  // tab ID → snapshot (for restore)
+    private var closedTabs: [ClosedTab] = []  // recently closed, newest first
+    private let maxClosedTabs = 20
+
     private var sessionFileCache: [Int: ClaudeSessionFile] = [:]
     private var sessionMetaCache: [String: SessionMeta] = [:]
     private var messageCountCache: [String: Int] = [:]
-    private var tabResourceCache: [Int: TabResources] = [:]  // shell PID → resources
+    private var tabResourceCache: [Int: TabResources] = [:]
 
     let slowInterval: TimeInterval = 5.0
     let fastInterval: TimeInterval = 1.0
@@ -158,6 +175,46 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             malloc_zone_pressure_relief(nil, 0)
 
             DispatchQueue.main.async {
+                // Detect closed tabs by diffing tab IDs
+                let currentIds = Set(state.flatMap { $0.tabs.map(\.id) })
+                if !self.previousTabIds.isEmpty {
+                    for tabId in self.previousTabIds.subtracting(currentIds) {
+                        if let snapshot = self.previousTabSnapshots[tabId] {
+                            self.closedTabs.insert(snapshot, at: 0)
+                        }
+                    }
+                    if self.closedTabs.count > self.maxClosedTabs {
+                        self.closedTabs = Array(self.closedTabs.prefix(self.maxClosedTabs))
+                    }
+                }
+
+                // Snapshot current tabs for next diff
+                self.previousTabIds = currentIds
+                self.previousTabSnapshots = [:]
+                for osWin in state {
+                    for tab in osWin.tabs {
+                        guard let win = tab.windows.first else { continue }
+                        let fgClaude = win.foregroundProcesses.first {
+                            $0.cmdline.contains { $0 == "claude" || $0.hasSuffix("/claude") }
+                        }
+                        var claudeId: String?
+                        if let fg = fgClaude {
+                            if let sf = sessions[fg.pid] { claudeId = sf.sessionId }
+                            else if let ri = fg.cmdline.firstIndex(of: "--resume"),
+                                    ri + 1 < fg.cmdline.count,
+                                    fg.cmdline[ri + 1].count > 30 {
+                                claudeId = fg.cmdline[ri + 1]
+                            }
+                        }
+                        self.previousTabSnapshots[tab.id] = ClosedTab(
+                            title: tab.title, cwd: win.cwd, layout: tab.layout,
+                            shell: win.cmdline,
+                            foregroundCmd: fgClaude?.cmdline ?? [],
+                            closedAt: Date(), claudeSessionId: claudeId
+                        )
+                    }
+                }
+
                 self.cachedState = state
                 self.sessionFileCache = sessions
                 self.tabResourceCache = resources
@@ -269,6 +326,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func rebuildMenuFromCache() {
         menu.removeAllItems()
         buildActiveSection()
+        buildClosedSection()
         buildHistorySection()
         buildFooter()
         let tabCount = cachedState.reduce(0) { $0 + $1.tabs.count }
@@ -329,6 +387,37 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let sub = LazyTabMenu(appDelegate: self, tab: tab, claudeInfo: info, resources: res)
         item.submenu = sub
         menu.addItem(item)
+    }
+
+    private func buildClosedSection() {
+        guard !closedTabs.isEmpty else { return }
+
+        addSeparator()
+        addLabel("Recently Closed", bold: true, size: 12)
+        addSeparator()
+
+        let fmt = DateFormatter()
+        fmt.dateFormat = "HH:mm"
+
+        for (i, closed) in closedTabs.prefix(8).enumerated() {
+            let title = truncate(closed.title, to: 45)
+            let time = fmt.string(from: closed.closedAt)
+            let cwd = shortenPath(closed.cwd)
+            let isClaude = closed.claudeSessionId != nil
+
+            let item = NSMenuItem(title: title, action: #selector(restoreClosedTab(_:)), keyEquivalent: "")
+            item.target = self
+            item.tag = i
+
+            let attr = NSMutableAttributedString()
+            if isClaude {
+                attr.append(styled("◆ ", size: 12, color: .systemOrange))
+            }
+            attr.append(styled(title, size: 12))
+            attr.append(styled("  \(cwd)  \(time)", size: 10, color: .tertiaryLabelColor))
+            item.attributedTitle = attr
+            menu.addItem(item)
+        }
     }
 
     private func buildHistorySection() {
@@ -457,6 +546,33 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         launchArgs.append(contentsOf: ["--resume", info.sessionId])
 
         shell(launchArgs)
+        activateKitty()
+    }
+
+    @objc func restoreClosedTab(_ sender: NSMenuItem) {
+        let idx = sender.tag
+        guard idx >= 0, idx < closedTabs.count else { return }
+        let closed = closedTabs[idx]
+
+        if let sessionId = closed.claudeSessionId {
+            // Claude tab: resume session
+            shell("kitty", "@", "launch", "--type=tab",
+                  "--cwd=\(closed.cwd)",
+                  "claude", "--dangerously-skip-permissions",
+                  "--resume", sessionId)
+        } else if !closed.foregroundCmd.isEmpty {
+            // Had a foreground command: restore it
+            var args = ["kitty", "@", "launch", "--type=tab", "--cwd=\(closed.cwd)"]
+            args.append(contentsOf: closed.foregroundCmd)
+            shell(args)
+        } else {
+            // Plain shell tab: open shell in the same cwd
+            var args = ["kitty", "@", "launch", "--type=tab", "--cwd=\(closed.cwd)"]
+            args.append(contentsOf: closed.shell.isEmpty ? ["/bin/zsh"] : closed.shell)
+            shell(args)
+        }
+
+        closedTabs.remove(at: idx)
         activateKitty()
     }
 
