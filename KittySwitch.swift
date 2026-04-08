@@ -468,13 +468,20 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         activateKitty()
     }
 
+    /// Launch a command in a new kitty tab via login shell (ensures PATH includes mise/nvm/etc).
+    private func launchInTab(cwd: String, command: String) {
+        let safeCwd = cwd.isEmpty ? FileManager.default.homeDirectoryForCurrentUser.path : cwd
+        // Use login shell so PATH is properly initialized (mise, nvm, homebrew, etc.)
+        shell("kitty", "@", "launch", "--type=tab", "--cwd=\(safeCwd)",
+              "zsh", "-lc", command)
+    }
+
     @objc func resumeSession(_ sender: NSMenuItem) {
         guard let info = sender.representedObject as? ResumeInfo else { return }
-        let cwd = info.cwd.isEmpty ? FileManager.default.homeDirectoryForCurrentUser.path : info.cwd
-        var args = ["kitty", "@", "launch", "--type=tab", "--cwd=\(cwd)", "claude"]
-        if info.dangerousMode { args.append("--dangerously-skip-permissions") }
-        args.append(contentsOf: ["--resume", info.sessionId])
-        shell(args)
+        var cmd = "claude"
+        if info.dangerousMode { cmd += " --dangerously-skip-permissions" }
+        cmd += " --resume \(info.sessionId)"
+        launchInTab(cwd: info.cwd, command: cmd)
         activateKitty()
     }
 
@@ -484,12 +491,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let closed = closedTabs[idx]
 
         if let sessionId = closed.claudeSessionId {
-            shell("kitty", "@", "launch", "--type=tab", "--cwd=\(closed.cwd)",
-                  "claude", "--dangerously-skip-permissions", "--resume", sessionId)
+            launchInTab(cwd: closed.cwd, command: "claude --dangerously-skip-permissions --resume \(sessionId)")
         } else if !closed.foregroundCmd.isEmpty {
-            shell(["kitty", "@", "launch", "--type=tab", "--cwd=\(closed.cwd)"] + closed.foregroundCmd)
+            launchInTab(cwd: closed.cwd, command: closed.foregroundCmd.joined(separator: " "))
         } else {
-            shell(["kitty", "@", "launch", "--type=tab", "--cwd=\(closed.cwd)"] + (closed.shell.isEmpty ? ["/bin/zsh"] : closed.shell))
+            // Plain shell: just open a new tab (kitty will use default shell)
+            shell("kitty", "@", "launch", "--type=tab", "--cwd=\(closed.cwd)")
         }
         closedTabs.remove(at: idx)
         saveClosedTabs()
